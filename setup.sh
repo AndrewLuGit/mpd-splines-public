@@ -39,7 +39,7 @@ cd "${THIS_DIR}"/mpd/motion_planning_baselines && pip install -e .
 echo "-------> Installing pybullet_ompl"
 conda activate ${CONDA_ENV_NAME}
 cd "${DEPS_DIR}"/pybullet_ompl || exit 1
-git clone git@github.com:ompl/ompl.git
+git clone https://github.com/ompl/ompl.git
 cd ompl || exit 1
 git checkout fca10b4bd4840856c7a9f50d1ee2688ba77e25aa
 mkdir -p build/Release

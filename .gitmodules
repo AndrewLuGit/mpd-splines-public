@@ -3,7 +3,7 @@
 	url = https://git.ias.informatik.tu-darmstadt.de/common/experiment_launcher.git
 [submodule "deps/pybullet_ompl"]
 	path = deps/pybullet_ompl
-	url = git@github.com:joaoamcarvalho/pybullet_ompl.git
+	url = https://github.com/joaoamcarvalho/pybullet_ompl.git
 [submodule "deps/theseus"]
 	path = deps/theseus
-	url = git@github.com:facebookresearch/theseus.git
+	url = https://github.com/facebookresearch/theseus.git

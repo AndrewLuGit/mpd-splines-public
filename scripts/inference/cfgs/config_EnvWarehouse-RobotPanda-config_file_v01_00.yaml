@@ -12,8 +12,8 @@ model_selection: 'bspline'  # 'bspline', 'waypoints'
 
 min_distance_q_pos_start_goal: 3.5  # minimum distance between start and goal configurations np.sqrt(7*2*(np.pi/2)**2)=5.88
 
-env_id_replace: null
-#env_id_replace: 'EnvWarehouseExtraObjectsV00'
+# env_id_replace: null
+env_id_replace: 'EnvWarehouseExtraObjectsV00'
 
 grasped_object: null
 
