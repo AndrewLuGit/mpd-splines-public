@@ -1,5 +1,5 @@
-import collections
 import random
+from collections.abc import Mapping
 from typing import List
 
 import numpy as np
@@ -20,7 +20,7 @@ DEFAULT_TENSOR_ARGS = {"device": get_torch_device("cuda"), "dtype": torch.float3
 
 
 def dict_to_device(ob, device, **kwargs):
-    if isinstance(ob, collections.Mapping):
+    if isinstance(ob, Mapping):
         return {k: dict_to_device(v, device) for k, v in ob.items()}
     else:
         return ob.to(device)

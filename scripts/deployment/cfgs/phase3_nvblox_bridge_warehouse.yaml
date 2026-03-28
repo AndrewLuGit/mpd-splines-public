@@ -1,0 +1,55 @@
+results_dir: logs/phase3_nvblox_bridge
+
+depth_bundle_path: logs/phase2_sapien_depth_capture/depth_capture_bundle.npz
+scene_spec_path: logs/phase2_sapien_depth_capture/scene_spec.yaml
+
+device: cuda
+integrator_type: tsdf
+extraction_method: tsdf_sparse
+pose_convention: sapien
+voxel_size: 0.05
+workspace_padding: 0.0
+query_chunk_size: 250000
+
+# Occupancy integrator query threshold.
+# Voxels with log-odds above this value are exported as occupied.
+occupancy_threshold_log_odds: 0.0
+
+# TSDF query thresholds used only when integrator_type=tsdf.
+tsdf_weight_threshold: 0.0001
+tsdf_distance_threshold: 0.0
+
+# Filter small noisy components before converting occupancy to boxes.
+min_component_voxels: 4
+max_boxes:
+merge_strategy: greedy_cuboids
+
+# Ignore known static warehouse geometry so the exported boxes are closer to
+# runtime obstacles that should be injected as EnvWarehouse obj_extra_list.
+ignore_scene_box_sources:
+  - fixed
+ignore_scene_box_margin: 0.10
+
+# Optional extra ignore regions, useful if the Phase 2 capture also rendered the robot.
+ignore_boxes: []
+ignore_box_margin: 0.0
+subtract_robot: true
+robot_sphere_margin: 0.11
+
+# Optional MapperParams overrides. Example structure:
+mapper_params:
+  projective_integrator_params:
+    projective_integrator_max_integration_distance_m: 4.0
+
+boxes_filename: phase3_boxes.yaml
+summary_filename: phase3_summary.yaml
+voxels_filename: phase3_occupied_voxels.npz
+save_occupancy_projections: true
+projection_dirname: occupancy_projections
+projection_prefix: phase3
+save_scene_debug_plot: true
+scene_debug_plot_filename: phase3_scene_debug.png
+show_scene_debug_plot: true
+draw_occupied_voxels: true
+draw_robot_ignore_spheres: true
+scene_debug_title: Phase 3 Scene Debug

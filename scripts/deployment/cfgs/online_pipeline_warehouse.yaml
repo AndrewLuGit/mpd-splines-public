@@ -1,0 +1,26 @@
+results_dir: logs/online_pipeline_warehouse
+seed: 2
+
+phase1_cfg_path: scripts/deployment/cfgs/phase1_online_planner_warehouse.yaml
+phase2_cfg_path: scripts/deployment/cfgs/phase2_sapien_depth_capture_warehouse.yaml
+phase3_cfg_path: scripts/deployment/cfgs/phase3_nvblox_bridge_warehouse.yaml
+
+phase2_results_subdir: phase2_capture
+phase3_results_subdir: phase3_nvblox
+phase1_results_subdir: phase1_planning
+
+# Leave q_start/ee_goal_pose null to reuse the Phase 1 reference sample.
+q_start: null
+ee_goal_pose: null
+reference_split: validation
+reference_index: 1
+
+# If null, the pipeline uses the Phase 2 config's extra_boxes as the capture-time
+# runtime obstacles and Phase 1 consumes only the reconstructed boxes.
+runtime_extra_boxes: null
+
+# Optional shallow/deep overrides for the underlying phase configs.
+phase1_overrides: {}
+phase2_overrides:
+  attempt_live_capture: true
+phase3_overrides: {}

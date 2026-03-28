@@ -12,6 +12,7 @@ from sklearn.gaussian_process.kernels import RBF
 
 from mpd.models import GaussianDiffusionModel, guide_gradient_steps, CVAEModel
 from mpd.utils.loaders import load_params_from_yaml
+from mpd.utils.torch_compat import torch_load_compat
 from pb_ompl.pb_ompl import add_box, fit_bspline_to_path
 from scripts.generate_data.generate_trajectories import GenerateDataOMPL
 from mpd.inference.cost_guides import CostGuideManagerParametricTrajectory, NoCostException
@@ -319,7 +320,7 @@ class GenerativeOptimizationPlanner:
         model_path = os.path.join(
             args_inference.model_dir, "checkpoints", f'{"ema_" if args_train["use_ema"] else ""}model_current.pth'
         )
-        self.model = torch.load(model_path, map_location=tensor_args["device"])
+        self.model = torch_load_compat(model_path, map_location=tensor_args["device"])
         self.model.eval()
         freeze_torch_model_params(self.model)
 

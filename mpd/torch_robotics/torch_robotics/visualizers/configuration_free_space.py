@@ -1,7 +1,6 @@
 import einops
 from scipy import ndimage
 
-import isaacgym
 import matplotlib
 import numpy as np
 import torch

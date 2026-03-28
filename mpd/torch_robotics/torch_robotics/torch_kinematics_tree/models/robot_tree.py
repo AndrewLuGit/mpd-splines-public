@@ -55,7 +55,6 @@ from dataclasses import dataclass
 
 import torch
 import numpy as np
-from torch._functorch.deprecated import jacrev
 from torch.autograd.functional import jacobian
 
 from torch_robotics.torch_kinematics_tree.geometrics.quaternion import q_to_axis_angles, q_div, q_convert_to_wxyz

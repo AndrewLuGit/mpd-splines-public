@@ -2,5 +2,5 @@ pyyaml
 urdf-parser-py
 matplotlib
 sobol_seq
-ghalton
+ghalton; python_version < "3.10"
 trimesh

@@ -1,0 +1,75 @@
+cfg_inference_path: scripts/inference/cfgs/config_EnvWarehouse-RobotPanda-config_file_v01_00.yaml
+results_dir: logs/phase1_online_planner
+
+device: cuda:0
+seed: 2
+debug: false
+
+env_id_override: EnvWarehouse
+
+# Leave q_start null to reuse a validation sample's start state.
+q_start: null
+
+# Leave ee_goal_pose null to reuse a validation sample's end-effector goal pose.
+# To use a manual target instead, replace null with:
+# ee_goal_pose:
+#   position: [0.55, 0.00, 0.55]
+#   orientation_euler_xyz_deg: [180.0, 0.0, -90.0]
+ee_goal_pose: null
+
+reference_split: validation
+reference_index: 1
+
+# Optionally replace or augment the inline boxes above with reconstructed
+# runtime boxes from Phase 3.
+extra_boxes_path: logs/phase3_nvblox_bridge/phase3_boxes.yaml
+append_extra_boxes_from_path: false
+filter_extra_boxes_at_q_start: true
+start_state_filter_sphere_margin: 0.0
+start_state_filter_box_margin: 0.0
+planner_filter_extra_boxes_at_q_start: true
+planner_filter_mode: individual
+planner_filter_max_removals:
+save_start_state_filtered_boxes: true
+start_state_filtered_boxes_filename: phase1_filtered_boxes.yaml
+start_state_removed_boxes_filename: phase1_removed_boxes.yaml
+planner_filter_summary_filename: phase1_planner_filter_summary.yaml
+
+extra_boxes:
+  - name: runtime_box_0
+    center: [0.85, 0.10, 0.125]
+    size: [0.10, 0.25, 0.25]
+  - name: runtime_box_1
+    center: [0.60, -0.15, 0.25]
+    size: [0.25, 0.25, 0.50]
+
+n_ik_candidates: 128
+max_goal_candidates: 4
+ik_max_iterations: 500
+ik_lr: 0.2
+ik_se3_eps: 0.05
+
+run_sapien: true
+render_sapien_viewer: true
+sapien_viewer_preset: isaac_gym_default
+sapien_add_ground: false
+sapien_scene_timestep: 0.004166666666666667
+sapien_render_every_n_steps: 4
+sapien_drive_stiffness: 200.0
+sapien_drive_damping: 40.0
+sapien_force_limit: 1000.0
+sapien_drive_mode: force
+sapien_balance_passive_force: true
+sapien_compensate_gravity: true
+sapien_compensate_coriolis_and_centrifugal: true
+sapien_n_pre_steps: 5
+sapien_n_post_steps: 10
+sapien_robot:
+  enabled: true
+  fix_root_link: true
+draw_collision_spheres: false
+save_ik_debug_plot_on_failure: true
+show_ik_debug_plot: true
+ik_debug_plot_filename: ik_debug.png
+max_collision_free_to_render: 4
+max_colliding_to_render: 4

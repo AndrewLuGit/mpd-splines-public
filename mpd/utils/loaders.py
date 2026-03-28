@@ -16,6 +16,7 @@ from mpd.parametric_trajectory.trajectory_bspline import ParametricTrajectoryBsp
 from mpd.parametric_trajectory.trajectory_waypoints import ParametricTrajectoryWaypoints
 from mpd.paths import DATASET_BASE_DIR
 from mpd.utils import model_loader
+from mpd.utils.torch_compat import torch_load_compat
 from torch_robotics import environments, robots
 from torch_robotics.tasks.tasks import PlanningTask
 from torch_robotics.torch_utils.torch_utils import freeze_torch_model_params, DEFAULT_TENSOR_ARGS
@@ -166,8 +167,8 @@ def get_planning_task_and_dataset(
     if load_indices:
         # load the indices of training and validation sets (for evaluation)
         assert model_dir is not None, "model_dir must be provided when load_indices is True"
-        train_subset_indices = torch.load(os.path.join(model_dir, f"train_subset_indices.pt"))
-        val_subset_indices = torch.load(os.path.join(model_dir, f"val_subset_indices.pt"))
+        train_subset_indices = torch_load_compat(os.path.join(model_dir, f"train_subset_indices.pt"))
+        val_subset_indices = torch_load_compat(os.path.join(model_dir, f"val_subset_indices.pt"))
     else:
         # split into train and validation
         # the training and validation sets are split by task id
@@ -217,7 +218,7 @@ def get_model(
 ):
 
     if checkpoint_path is not None:
-        model = torch.load(checkpoint_path)
+        model = torch_load_compat(checkpoint_path)
         if freeze_loaded_model:
             freeze_torch_model_params(model)
     else:
