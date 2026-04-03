@@ -35,6 +35,10 @@ from mpd.deployment.sapien_depth_adapter import (
     save_yaml,
 )
 from mpd.deployment.scene_voxelizer import save_occupancy_projections
+from mpd.deployment.sapien_trajectory_executor import (
+    visualize_box_collision_debug_in_sapien,
+    visualize_phase3_scene_debug_in_sapien,
+)
 from mpd.paths import REPO_PATH
 from mpd.utils.loaders import load_params_from_yaml, save_to_yaml
 from torch_robotics.torch_utils.seed import fix_random_seed
@@ -77,6 +81,7 @@ def _prepare_start_and_goal(cfg_pipeline, cfg_phase1, tensor_args, results_dir):
         debug=cfg_phase1.get("debug", False),
         results_dir=results_dir,
         env_id_override=cfg_phase1.get("env_id_override", "EnvWarehouse"),
+        env_sdf_cell_size=cfg_phase1.get("env_sdf_cell_size"),
     )
     try:
         reference_sample = bootstrap_planner.get_reference_sample(
@@ -195,6 +200,7 @@ def _run_reconstruction_phase(cfg_phase3, bundle, scene_spec, q_start):
         ignore_scene_box_margin=cfg_phase3.get("ignore_scene_box_margin", 0.0),
         robot_ignore_spheres=robot_ignore_spheres,
         robot_sphere_margin=0.0,
+        inflate_robot_mask_by_voxel_extent=cfg_phase3.get("inflate_robot_mask_by_voxel_extent", True),
         min_component_voxels=cfg_phase3.get("min_component_voxels", 1),
         max_boxes=cfg_phase3.get("max_boxes"),
         merge_strategy=cfg_phase3.get("merge_strategy", "greedy_cuboids"),
@@ -230,12 +236,26 @@ def _run_reconstruction_phase(cfg_phase3, bundle, scene_spec, q_start):
             title=cfg_phase3.get("scene_debug_title", "Phase 3 Scene Debug"),
         )
 
+    scene_debug_viewer_stats = None
+    if cfg_phase3.get("show_scene_debug_viewer", False):
+        scene_debug_viewer_stats = visualize_phase3_scene_debug_in_sapien(
+            scene_spec=scene_spec,
+            robot_cfg=robot_cfg,
+            reconstructed_boxes=result.merged_boxes,
+            robot_collision_spheres=result.robot_ignore_spheres if cfg_phase3.get("draw_robot_ignore_spheres", True) else None,
+            render_viewer=True,
+            add_ground=cfg_phase3.get("scene_debug_add_ground", False),
+            viewer_preset=cfg_phase3.get("scene_debug_viewer_preset", "isaac_gym_default"),
+            step_physics=cfg_phase3.get("scene_debug_step_physics", False),
+        )
+
     return {
         "results_dir": results_dir,
         "result": result,
         "saved_paths": saved_paths,
         "projection_paths": projection_paths,
         "scene_debug_path": scene_debug_path,
+        "scene_debug_viewer_stats": scene_debug_viewer_stats,
     }
 
 
@@ -247,6 +267,7 @@ def _run_planning_phase(cfg_phase1, q_start, ee_pose_goal, filtered_boxes, resul
         debug=cfg_phase1.get("debug", False),
         results_dir=results_dir,
         env_id_override=cfg_phase1.get("env_id_override", "EnvWarehouse"),
+        env_sdf_cell_size=cfg_phase1.get("env_sdf_cell_size"),
     )
 
     try:
@@ -330,6 +351,8 @@ def main():
     cfg_phase2["results_dir"] = os.path.join(base_results_dir, cfg_pipeline.get("phase2_results_subdir", "phase2_capture"))
     cfg_phase3["results_dir"] = os.path.join(base_results_dir, cfg_pipeline.get("phase3_results_subdir", "phase3_nvblox"))
     cfg_phase1["results_dir"] = os.path.join(base_results_dir, cfg_pipeline.get("phase1_results_subdir", "phase1_planning"))
+    if cfg_phase1.get("env_sdf_cell_size") is None:
+        cfg_phase1["env_sdf_cell_size"] = cfg_phase3.get("voxel_size")
 
     bootstrap_planner, q_start, ee_pose_goal = _prepare_start_and_goal(
         cfg_pipeline=cfg_pipeline,
@@ -365,7 +388,7 @@ def main():
         filtered_boxes, removed_boxes = filter_box_specs_for_panda_q(
             reconstruction_info["result"].merged_boxes,
             q=q_start,
-            gripper=bool(cfg_phase1.get("start_state_filter_gripper", False)),
+            gripper=bool(cfg_phase1.get("start_state_filter_gripper", True)),
             sphere_margin=cfg_phase1.get("start_state_filter_sphere_margin", 0.0),
             box_margin=cfg_phase1.get("start_state_filter_box_margin", 0.0),
         )
@@ -373,17 +396,37 @@ def main():
         planner_filter_summary = None
         if cfg_phase1.get("planner_filter_extra_boxes_at_q_start", True):
             filtered_boxes, planner_pruned_boxes, planner_filter_summary = prune_extra_boxes_for_collision_free_q_start(
-                cfg_inference_path=cfg_phase1["cfg_inference_path"],
+                planner=bootstrap_planner,
                 q_start=q_start,
                 extra_boxes=filtered_boxes,
-                device=cfg_phase1.get("device", "cuda:0"),
-                debug=cfg_phase1.get("debug", False),
-                results_dir=cfg_phase1["results_dir"],
-                env_id_override=cfg_phase1.get("env_id_override", "EnvWarehouse"),
                 max_removals=cfg_phase1.get("planner_filter_max_removals"),
                 mode=cfg_phase1.get("planner_filter_mode", "individual"),
             )
             removed_boxes.extend(planner_pruned_boxes)
+        pre_pruning_sapien_debug = None
+        if cfg_pipeline.get("show_pre_pruning_collision_viewer", False):
+            robot_collision_spheres = build_robot_ignore_spheres(
+                robot_cfg={
+                    "enabled": True,
+                    "gripper": bool(cfg_phase1.get("start_state_filter_gripper", True)),
+                    "qpos": to_torch(q_start, device=torch.device("cpu"), dtype=torch.float32).tolist(),
+                },
+                robot_sphere_margin=cfg_phase1.get("start_state_filter_sphere_margin", 0.0),
+            )
+            pre_pruning_sapien_debug = visualize_box_collision_debug_in_sapien(
+                scene_spec=capture_info["scene_spec"],
+                robot_cfg={
+                    "enabled": True,
+                    "gripper": bool(cfg_phase1.get("start_state_filter_gripper", True)),
+                    "qpos": to_torch(q_start, device=torch.device("cpu"), dtype=torch.float32).tolist(),
+                },
+                colliding_boxes=removed_boxes,
+                noncolliding_boxes=filtered_boxes if cfg_pipeline.get("show_noncolliding_pre_pruning_boxes", True) else [],
+                robot_collision_spheres=robot_collision_spheres,
+                render_viewer=True,
+                add_ground=cfg_pipeline.get("pre_pruning_collision_add_ground", False),
+                viewer_preset=cfg_pipeline.get("pre_pruning_collision_viewer_preset", "isaac_gym_default"),
+            )
 
         phase1_results_dir = _resolve_repo_path(cfg_phase1["results_dir"])
         os.makedirs(phase1_results_dir, exist_ok=True)
@@ -435,6 +478,8 @@ def main():
         print(f"removed_boxes_at_q_start: {len(removed_boxes)}")
         if planner_pruned_boxes:
             print(f"planner_pruned_boxes_at_q_start: {len(planner_pruned_boxes)}")
+        if pre_pruning_sapien_debug is not None:
+            print(f"pre_pruning_colliding_boxes_visualized: {pre_pruning_sapien_debug['n_colliding_boxes']}")
 
         print("\n----------------CAPTURE----------------")
         print(f"scene_spec_path: {capture_info['scene_spec_path']}")
@@ -450,6 +495,11 @@ def main():
         print(f"voxels_path: {reconstruction_info['saved_paths']['voxels_path']}")
         if reconstruction_info["scene_debug_path"] is not None:
             print(f"scene_debug_plot: {reconstruction_info['scene_debug_path']}")
+        if reconstruction_info["scene_debug_viewer_stats"] is not None:
+            print(
+                "scene_debug_viewer_reconstructed_boxes: "
+                f"{reconstruction_info['scene_debug_viewer_stats']['n_reconstructed_boxes']}"
+            )
 
         print("\n----------------PLANNING----------------")
         pprint(results_single_plan.ik_attempt_summaries)

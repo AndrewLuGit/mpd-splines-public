@@ -1,5 +1,6 @@
 import gc
 import os
+from contextlib import contextmanager
 
 import torch
 from dotmap import DotMap
@@ -53,6 +54,100 @@ def _select_model_dir(args_inference):
     raise NotImplementedError("Unsupported planner/model selection combination")
 
 
+def _scalarize_collision_metric(value):
+    value_th = torch.as_tensor(value)
+    if value_th.numel() == 0:
+        return False, 0.0
+    value_flat = value_th.reshape(-1)
+    if value_flat.dtype == torch.bool:
+        colliding = bool(value_flat.any().item())
+        cost = float(value_flat.float().max().item())
+    else:
+        cost = float(value_flat.max().item())
+        colliding = cost > 0.0
+    return colliding, cost
+
+
+@contextmanager
+def _temporary_env_extra_boxes(env, obj_extra_list):
+    original_obj_extra_list = list(env.get_obj_extra_list())
+    original_grid_map_sdf_obj_extra = getattr(env, "grid_map_sdf_obj_extra", None)
+    try:
+        env.set_obj_extra_list(obj_extra_list)
+        env.grid_map_sdf_obj_extra = None
+        yield
+    finally:
+        env.set_obj_extra_list(original_obj_extra_list)
+        env.grid_map_sdf_obj_extra = original_grid_map_sdf_obj_extra
+
+
+def compute_q_collision_breakdown(planner, q):
+    planning_task = planner.planning_task
+    env = planning_task.env
+    q_t = to_torch(q, **planner.tensor_args)
+    q_pos = planning_task.get_position(q_t)
+    fk_collision_pos = planning_task.robot.fk_map_collision(q_pos)
+
+    def field_metrics(field):
+        if field is None:
+            return {"colliding": False, "cost": 0.0}
+        colliding, _ = _scalarize_collision_metric(
+            field.compute_cost(q_pos, fk_collision_pos, field_type="occupancy")
+        )
+        _, cost_sdf = _scalarize_collision_metric(field.compute_cost(q_pos, fk_collision_pos, field_type="sdf"))
+        return {"colliding": colliding, "cost": cost_sdf}
+
+    self_metrics = field_metrics(planning_task.get_collision_self_field())
+    object_metrics = field_metrics(planning_task.get_collision_objects_field())
+    ws_metrics = field_metrics(planning_task.get_collision_ws_boundaries_field())
+
+    extra_metrics = {"colliding": False, "cost": 0.0}
+    if planning_task.get_collision_extra_objects_field() is not None and env.get_obj_extra_list():
+        extra_metrics = field_metrics(planning_task.get_collision_extra_objects_field())
+
+    if env.get_obj_extra_list():
+        with _temporary_env_extra_boxes(env, []):
+            fixed_object_metrics = field_metrics(planning_task.get_collision_objects_field())
+    else:
+        fixed_object_metrics = dict(object_metrics)
+
+    overall_metrics = {
+        "colliding": bool(
+            self_metrics["colliding"] or object_metrics["colliding"] or ws_metrics["colliding"]
+        ),
+        "cost": float(self_metrics["cost"] + object_metrics["cost"] + ws_metrics["cost"]),
+    }
+    combined_colliding = bool(planning_task.compute_collision(q_t).reshape(-1)[0].item())
+    combined_cost = float(torch.as_tensor(planning_task.compute_collision_cost(q_t)).reshape(-1).max().item())
+
+    return {
+        "overall": overall_metrics,
+        "self_collision": self_metrics,
+        "object_collision_any": object_metrics,
+        "object_collision_fixed_only": fixed_object_metrics,
+        "object_collision_extra_only": extra_metrics,
+        "workspace_boundary_collision": ws_metrics,
+        "combined_check": {"colliding": combined_colliding, "cost": combined_cost},
+    }
+
+
+def format_q_collision_breakdown(collision_breakdown):
+    ordered_keys = [
+        ("overall", "overall"),
+        ("self_collision", "self"),
+        ("object_collision_any", "objects_any"),
+        ("object_collision_fixed_only", "objects_fixed_only"),
+        ("object_collision_extra_only", "objects_extra_only"),
+        ("workspace_boundary_collision", "workspace"),
+        ("combined_check", "combined"),
+    ]
+    parts = []
+    for key, label in ordered_keys:
+        metrics = collision_breakdown[key]
+        parts.append(f"{label}=colliding:{metrics['colliding']},cost:{metrics['cost']:.6f}")
+    return "; ".join(parts)
+
+
 class OnlineMPDPlanner:
     def __init__(
         self,
@@ -62,6 +157,7 @@ class OnlineMPDPlanner:
         debug=False,
         results_dir="logs/phase1_online_planner",
         env_id_override="EnvWarehouse",
+        env_sdf_cell_size=None,
     ):
         self.debug = debug
         self.results_dir = _resolve_repo_path(results_dir)
@@ -79,7 +175,7 @@ class OnlineMPDPlanner:
 
         self.extra_object_fields = build_object_fields_from_boxes(extra_boxes, tensor_args=self.tensor_args)
 
-        self.args_train.update(
+        update_kwargs = dict(
             **self.args_inference,
             gripper=True,
             reload_data=False,
@@ -88,6 +184,9 @@ class OnlineMPDPlanner:
             tensor_args=self.tensor_args,
             obj_extra_list=self.extra_object_fields,
         )
+        if env_sdf_cell_size is not None:
+            update_kwargs["sdf_cell_size"] = float(env_sdf_cell_size)
+        self.args_train.update(**update_kwargs)
 
         self.planning_task, self.train_subset, _, self.val_subset, _ = get_planning_task_and_dataset(**self.args_train)
         self.dataset = self.train_subset.dataset
@@ -101,6 +200,7 @@ class OnlineMPDPlanner:
         )
         self.planning_metrics_calculator = PlanningMetricsCalculator(self.planning_task)
         self.last_ik_debug_data = None
+        self.last_q_collision_debug = None
 
     def get_reference_sample(self, index=0, selection="validation"):
         subset = self.val_subset if selection == "validation" else self.train_subset
@@ -193,8 +293,13 @@ class OnlineMPDPlanner:
         if q_goal_candidates.numel() == 0:
             raise RuntimeError("No collision-free IK candidate was found for the requested EE goal pose")
 
-        if self.planning_task.compute_collision(q_start).item():
-            raise RuntimeError("q_start is in collision with the current environment")
+        q_start_collision_debug = compute_q_collision_breakdown(self, q_start)
+        self.last_q_collision_debug = q_start_collision_debug
+        if q_start_collision_debug["combined_check"]["colliding"]:
+            raise RuntimeError(
+                "q_start is in collision with the current environment. "
+                f"{format_q_collision_breakdown(q_start_collision_debug)}"
+            )
 
         attempts = []
         best_failure = None
@@ -358,54 +463,38 @@ class OnlineMPDPlanner:
 
 
 def evaluate_q_start_collision_with_boxes(
-    cfg_inference_path,
+    planner,
     q_start,
     extra_boxes=None,
-    device="cuda:0",
-    debug=False,
-    results_dir="logs/phase1_online_planner",
-    env_id_override="EnvWarehouse",
 ):
-    planner = OnlineMPDPlanner(
-        cfg_inference_path=cfg_inference_path,
-        extra_boxes=extra_boxes,
-        device=device,
-        debug=debug,
-        results_dir=results_dir,
-        env_id_override=env_id_override,
-    )
-    try:
-        q_start_t = to_torch(q_start, **planner.tensor_args)
-        colliding = bool(planner.planning_task.compute_collision(q_start_t).reshape(-1)[0].item())
-        collision_cost = planner.planning_task.compute_collision_cost(q_start_t)
-        collision_cost = float(torch.as_tensor(collision_cost).reshape(-1).max().item())
-        return {"colliding": colliding, "collision_cost": collision_cost}
-    finally:
-        planner.cleanup()
+    env = planner.planning_task.env
+    with _temporary_env_extra_boxes(
+        env,
+        build_object_fields_from_boxes(extra_boxes, tensor_args=planner.tensor_args),
+    ):
+        metrics = compute_q_collision_breakdown(planner, q_start)
+        return {
+            "colliding": metrics["combined_check"]["colliding"],
+            "collision_cost": metrics["combined_check"]["cost"],
+            "breakdown": metrics,
+        }
 
 
 def prune_extra_boxes_for_collision_free_q_start(
-    cfg_inference_path,
+    planner,
     q_start,
     extra_boxes,
-    device="cuda:0",
-    debug=False,
-    results_dir="logs/phase1_online_planner",
-    env_id_override="EnvWarehouse",
     max_removals=None,
     mode="individual",
 ):
     extra_boxes = list(extra_boxes or [])
     diagnostics = []
+    max_removals = len(extra_boxes) if max_removals is None else int(max_removals)
 
     base_metrics = evaluate_q_start_collision_with_boxes(
-        cfg_inference_path=cfg_inference_path,
+        planner=planner,
         q_start=q_start,
         extra_boxes=[],
-        device=device,
-        debug=debug,
-        results_dir=results_dir,
-        env_id_override=env_id_override,
     )
     if base_metrics["colliding"]:
         return extra_boxes, [], {"base_metrics": base_metrics, "iterations": diagnostics, "mode": mode}
@@ -415,13 +504,9 @@ def prune_extra_boxes_for_collision_free_q_start(
         removed_boxes = []
         for box_idx, box_spec in enumerate(extra_boxes):
             candidate_metrics = evaluate_q_start_collision_with_boxes(
-                cfg_inference_path=cfg_inference_path,
+                planner=planner,
                 q_start=q_start,
                 extra_boxes=[box_spec],
-                device=device,
-                debug=debug,
-                results_dir=results_dir,
-                env_id_override=env_id_override,
             )
             if candidate_metrics["colliding"]:
                 removed_boxes.append(box_spec)
@@ -436,14 +521,61 @@ def prune_extra_boxes_for_collision_free_q_start(
                 kept_boxes.append(box_spec)
 
         final_metrics = evaluate_q_start_collision_with_boxes(
-            cfg_inference_path=cfg_inference_path,
+            planner=planner,
             q_start=q_start,
             extra_boxes=kept_boxes,
-            device=device,
-            debug=debug,
-            results_dir=results_dir,
-            env_id_override=env_id_override,
         )
+
+        # If the full kept set still collides, run a bounded leave-one-out cleanup pass on the
+        # reduced subset. This catches cases where the per-box "alone" test is too weak.
+        while (
+            final_metrics["colliding"]
+            and kept_boxes
+            and len(removed_boxes) < max_removals
+        ):
+            best_idx = None
+            best_metrics = None
+            best_box = None
+
+            for box_idx, box_spec in enumerate(kept_boxes):
+                candidate_boxes = kept_boxes[:box_idx] + kept_boxes[box_idx + 1 :]
+                candidate_metrics = evaluate_q_start_collision_with_boxes(
+                    planner=planner,
+                    q_start=q_start,
+                    extra_boxes=candidate_boxes,
+                )
+
+                is_better = False
+                if best_metrics is None:
+                    is_better = True
+                elif best_metrics["colliding"] and not candidate_metrics["colliding"]:
+                    is_better = True
+                elif best_metrics["colliding"] == candidate_metrics["colliding"]:
+                    is_better = candidate_metrics["collision_cost"] < best_metrics["collision_cost"]
+
+                if is_better:
+                    best_idx = box_idx
+                    best_metrics = candidate_metrics
+                    best_box = box_spec
+
+            if best_idx is None or best_metrics is None:
+                break
+
+            diagnostics.append(
+                {
+                    "removed_box_name": best_box.get("name", f"runtime_box_{best_idx}"),
+                    "reason": "leave_one_out_cleanup_after_individual_pass",
+                    "collision_cost_before": final_metrics["collision_cost"],
+                    "collision_cost_after": best_metrics["collision_cost"],
+                    "colliding_before": final_metrics["colliding"],
+                    "colliding_after": best_metrics["colliding"],
+                    "breakdown_before": final_metrics.get("breakdown"),
+                    "breakdown_after": best_metrics.get("breakdown"),
+                }
+            )
+            removed_boxes.append(kept_boxes.pop(best_idx))
+            final_metrics = best_metrics
+
         return kept_boxes, removed_boxes, {
             "base_metrics": base_metrics,
             "final_metrics": final_metrics,
@@ -454,16 +586,11 @@ def prune_extra_boxes_for_collision_free_q_start(
     current_boxes = list(extra_boxes)
     removed_boxes = []
     current_metrics = evaluate_q_start_collision_with_boxes(
-        cfg_inference_path=cfg_inference_path,
+        planner=planner,
         q_start=q_start,
         extra_boxes=current_boxes,
-        device=device,
-        debug=debug,
-        results_dir=results_dir,
-        env_id_override=env_id_override,
     )
 
-    max_removals = len(current_boxes) if max_removals is None else int(max_removals)
     while current_metrics["colliding"] and current_boxes and len(removed_boxes) < max_removals:
         best_idx = None
         best_metrics = None
@@ -472,13 +599,9 @@ def prune_extra_boxes_for_collision_free_q_start(
         for box_idx, box_spec in enumerate(current_boxes):
             candidate_boxes = current_boxes[:box_idx] + current_boxes[box_idx + 1 :]
             candidate_metrics = evaluate_q_start_collision_with_boxes(
-                cfg_inference_path=cfg_inference_path,
+                planner=planner,
                 q_start=q_start,
                 extra_boxes=candidate_boxes,
-                device=device,
-                debug=debug,
-                results_dir=results_dir,
-                env_id_override=env_id_override,
             )
 
             is_better = False

@@ -180,7 +180,7 @@ def build_robot_ignore_spheres(robot_cfg, robot_sphere_margin=0.0):
     from torch_robotics.robots import RobotPanda
 
     tensor_args = {"device": torch.device("cpu"), "dtype": torch.float32}
-    robot = RobotPanda(gripper=False, tensor_args=tensor_args)
+    robot = RobotPanda(gripper=bool(robot_cfg.get("gripper", True)), tensor_args=tensor_args)
     try:
         qpos = robot_cfg.get("qpos")
         if qpos is None:
@@ -222,6 +222,7 @@ def reconstruct_occupancy_from_bundle(
     scene_spec=None,
     robot_ignore_spheres=None,
     robot_sphere_margin=0.0,
+    inflate_robot_mask_by_voxel_extent=True,
     min_component_voxels=1,
     max_boxes=None,
     extraction_method=None,
@@ -298,8 +299,16 @@ def reconstruct_occupancy_from_bundle(
         occupied_flat &= ~ignore_mask
 
     robot_ignore_spheres = inflate_sphere_specs(robot_ignore_spheres or [], robot_sphere_margin)
-    if robot_ignore_spheres:
-        robot_ignore_mask = mask_points_in_spheres(occupied_centers, robot_ignore_spheres)
+    robot_mask_voxel_extent_margin = 0.0
+    robot_mask_spheres = robot_ignore_spheres
+    if robot_ignore_spheres and inflate_robot_mask_by_voxel_extent:
+        # Remove any voxel whose occupied cube could intersect a robot sphere, not just
+        # voxels whose centers fall inside it.
+        robot_mask_voxel_extent_margin = 0.5 * np.sqrt(3.0) * float(voxel_size)
+        robot_mask_spheres = inflate_sphere_specs(robot_ignore_spheres, robot_mask_voxel_extent_margin)
+
+    if robot_mask_spheres:
+        robot_ignore_mask = mask_points_in_spheres(occupied_centers, robot_mask_spheres)
         occupied_flat &= ~robot_ignore_mask
 
     occupied_voxel_centers = occupied_centers[occupied_flat]
@@ -334,6 +343,8 @@ def reconstruct_occupancy_from_bundle(
             "ignore_box_margin": float(ignore_box_margin),
             "ignore_scene_box_margin": float(ignore_scene_box_margin),
             "robot_sphere_margin": float(robot_sphere_margin),
+            "inflate_robot_mask_by_voxel_extent": bool(inflate_robot_mask_by_voxel_extent),
+            "robot_mask_voxel_extent_margin": float(robot_mask_voxel_extent_margin),
             "merge_strategy": merge_strategy,
         },
     )

@@ -40,7 +40,8 @@ stereo_sensor_config: {}
 
 robot:
   enabled: true
-  # Franka Panda 7-DOF neutral configuration rendered with the no-gripper Panda URDF by default.
+  # Franka Panda 7-DOF neutral configuration rendered with the fixed-gripper Panda URDF by default.
+  gripper: true
   qpos: [0.0, -0.785398, 0.0, -2.356194, 0.0, 1.570796, 0.785398]
 
 # Live capture output path used only when attempt_live_capture=true and SAPIEN is installed.

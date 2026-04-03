@@ -62,7 +62,7 @@ def _sphere_intersects_axis_aligned_box(sphere_center, sphere_radius, box_center
 def filter_box_specs_for_panda_q(
     box_specs,
     q,
-    gripper=False,
+    gripper=True,
     sphere_margin=0.0,
     box_margin=0.0,
 ):

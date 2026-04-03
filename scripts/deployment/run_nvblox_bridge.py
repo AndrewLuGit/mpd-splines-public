@@ -20,6 +20,7 @@ from mpd.deployment.nvblox_bridge import (
     save_reconstruction_outputs,
 )
 from mpd.deployment.scene_box_visualizer import render_scene_boxes_debug
+from mpd.deployment.sapien_trajectory_executor import visualize_phase3_scene_debug_in_sapien
 from mpd.deployment.sapien_depth_adapter import load_depth_capture_bundle
 from mpd.deployment.scene_voxelizer import save_occupancy_projections
 from mpd.paths import REPO_PATH
@@ -85,6 +86,7 @@ def main():
         ignore_scene_box_margin=cfg.get("ignore_scene_box_margin", 0.0),
         robot_ignore_spheres=robot_ignore_spheres,
         robot_sphere_margin=0.0,
+        inflate_robot_mask_by_voxel_extent=cfg.get("inflate_robot_mask_by_voxel_extent", True),
         min_component_voxels=cfg.get("min_component_voxels", 1),
         max_boxes=cfg.get("max_boxes"),
         merge_strategy=cfg.get("merge_strategy", "greedy_cuboids"),
@@ -120,6 +122,19 @@ def main():
             title=cfg.get("scene_debug_title", "Phase 3 Scene Debug"),
         )
 
+    scene_debug_viewer_stats = None
+    if cfg.get("show_scene_debug_viewer", False):
+        scene_debug_viewer_stats = visualize_phase3_scene_debug_in_sapien(
+            scene_spec=scene_spec,
+            robot_cfg=robot_cfg,
+            reconstructed_boxes=result.merged_boxes,
+            robot_collision_spheres=result.robot_ignore_spheres if cfg.get("draw_robot_ignore_spheres", True) else None,
+            render_viewer=True,
+            add_ground=cfg.get("scene_debug_add_ground", False),
+            viewer_preset=cfg.get("scene_debug_viewer_preset", "isaac_gym_default"),
+            step_physics=cfg.get("scene_debug_step_physics", False),
+        )
+
     print("\n----------------PHASE 3 NVBLOX----------------")
     print(f"cfg: {cfg_path}")
     print(f"bundle_path: {bundle_path}")
@@ -139,6 +154,8 @@ def main():
     print(f"voxels_path: {saved_paths['voxels_path']}")
     if scene_debug_path is not None:
         print(f"scene_debug_plot: {scene_debug_path}")
+    if scene_debug_viewer_stats is not None:
+        print(f"scene_debug_viewer_reconstructed_boxes: {scene_debug_viewer_stats['n_reconstructed_boxes']}")
     if projection_paths:
         print("occupancy_projections:")
         for path in projection_paths:

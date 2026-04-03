@@ -6,6 +6,7 @@ seed: 2
 debug: false
 
 env_id_override: EnvWarehouse
+env_sdf_cell_size: 0.05
 
 # Leave q_start null to reuse a validation sample's start state.
 q_start: null
@@ -25,6 +26,7 @@ reference_index: 1
 extra_boxes_path: logs/phase3_nvblox_bridge/phase3_boxes.yaml
 append_extra_boxes_from_path: false
 filter_extra_boxes_at_q_start: true
+start_state_filter_gripper: true
 start_state_filter_sphere_margin: 0.0
 start_state_filter_box_margin: 0.0
 planner_filter_extra_boxes_at_q_start: true

@@ -18,6 +18,10 @@ reference_index: 1
 # If null, the pipeline uses the Phase 2 config's extra_boxes as the capture-time
 # runtime obstacles and Phase 1 consumes only the reconstructed boxes.
 runtime_extra_boxes: null
+show_pre_pruning_collision_viewer: true
+show_noncolliding_pre_pruning_boxes: true
+pre_pruning_collision_add_ground: false
+pre_pruning_collision_viewer_preset: isaac_gym_default
 
 # Optional shallow/deep overrides for the underlying phase configs.
 phase1_overrides: {}

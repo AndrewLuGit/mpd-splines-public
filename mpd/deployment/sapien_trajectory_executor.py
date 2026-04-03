@@ -5,6 +5,7 @@ from dataclasses import asdict
 import numpy as np
 
 from mpd.deployment.sapien_depth_adapter import (
+    _build_box_actor,
     _create_scene,
     _load_robot_articulation,
     _matrix_to_sapien_pose,
@@ -102,6 +103,157 @@ def _configure_viewer(viewer, scene_spec, sapien_module, view_preset="isaac_gym_
 
     camera_pose_world = make_camera_pose_look_at(camera_position, camera_target)
     viewer.set_camera_pose(_matrix_to_sapien_pose(sapien_module, camera_pose_world))
+
+
+def _with_box_pose_world(box_spec):
+    if "pose_world" in box_spec and box_spec["pose_world"] is not None:
+        return dict(box_spec)
+
+    pose_world = np.eye(4, dtype=np.float32)
+    pose_world[:3, 3] = np.asarray(box_spec["center"], dtype=np.float32)
+    enriched = dict(box_spec)
+    enriched["pose_world"] = pose_world.tolist()
+    enriched.setdefault("source", "reconstructed")
+    return enriched
+
+
+def _add_sphere_actor(scene, sapien_module, sphere_spec, color=(0.15, 0.8, 0.2)):
+    center = np.asarray(sphere_spec["center"], dtype=np.float32)
+    radius = float(sphere_spec["radius"])
+    builder = scene.create_actor_builder()
+    builder.add_sphere_visual(radius=radius, material=list(color))
+    actor = builder.build_static(name=sphere_spec.get("name", "debug_sphere"))
+    pose = np.eye(4, dtype=np.float32)
+    pose[:3, 3] = center
+    actor.set_pose(_matrix_to_sapien_pose(sapien_module, pose))
+    return actor
+
+
+def visualize_box_collision_debug_in_sapien(
+    scene_spec,
+    robot_cfg,
+    colliding_boxes,
+    noncolliding_boxes=None,
+    robot_collision_spheres=None,
+    render_viewer=True,
+    add_ground=False,
+    viewer_preset="isaac_gym_default",
+    step_physics=False,
+):
+    if not render_viewer:
+        return {
+            "n_colliding_boxes": len(colliding_boxes or []),
+            "n_noncolliding_boxes": len(noncolliding_boxes or []),
+            "n_robot_collision_spheres": len(robot_collision_spheres or []),
+        }
+
+    sapien, scene, _ = _create_scene(scene_spec=scene_spec, add_ground=add_ground)
+    viewer = None
+    try:
+        robot_cfg = dict(robot_cfg or {})
+        robot_cfg["enabled"] = True
+        _load_robot_articulation(scene, sapien, robot_cfg)
+
+        for box_spec in noncolliding_boxes or []:
+            _build_box_actor(
+                scene,
+                sapien,
+                _with_box_pose_world(box_spec),
+                add_collision=False,
+                color_by_source=False,
+                color_override=[0.2, 0.6, 0.95],
+            )
+
+        for box_spec in colliding_boxes or []:
+            _build_box_actor(
+                scene,
+                sapien,
+                _with_box_pose_world(box_spec),
+                add_collision=False,
+                color_by_source=False,
+                color_override=[0.9, 0.15, 0.15],
+            )
+
+        for sphere_spec in robot_collision_spheres or []:
+            _add_sphere_actor(scene, sapien, sphere_spec, color=(0.15, 0.8, 0.2))
+
+        viewer = scene.create_viewer()
+        _configure_viewer(viewer, scene_spec, sapien, view_preset=viewer_preset)
+
+        while not getattr(viewer, "closed", False):
+            if step_physics:
+                scene.step()
+            scene.update_render()
+            viewer.render()
+
+        return {
+            "n_colliding_boxes": len(colliding_boxes or []),
+            "n_noncolliding_boxes": len(noncolliding_boxes or []),
+            "n_robot_collision_spheres": len(robot_collision_spheres or []),
+            "viewer_closed_early": bool(getattr(viewer, "closed", False)),
+        }
+    finally:
+        if viewer is not None:
+            del viewer
+        del scene
+        del sapien
+
+
+def visualize_phase3_scene_debug_in_sapien(
+    scene_spec,
+    robot_cfg,
+    reconstructed_boxes,
+    robot_collision_spheres=None,
+    render_viewer=True,
+    add_ground=False,
+    viewer_preset="isaac_gym_default",
+    step_physics=False,
+):
+    if not render_viewer:
+        return {
+            "n_reconstructed_boxes": len(reconstructed_boxes or []),
+            "n_robot_collision_spheres": len(robot_collision_spheres or []),
+        }
+
+    sapien, scene, _ = _create_scene(scene_spec=scene_spec, add_ground=add_ground)
+    viewer = None
+    try:
+        robot_cfg = dict(robot_cfg or {})
+        robot_cfg["enabled"] = True
+        _load_robot_articulation(scene, sapien, robot_cfg)
+
+        for box_spec in reconstructed_boxes or []:
+            _build_box_actor(
+                scene,
+                sapien,
+                _with_box_pose_world(box_spec),
+                add_collision=False,
+                color_by_source=False,
+                color_override=[0.9, 0.15, 0.15],
+            )
+
+        for sphere_spec in robot_collision_spheres or []:
+            _add_sphere_actor(scene, sapien, sphere_spec, color=(0.15, 0.8, 0.2))
+
+        viewer = scene.create_viewer()
+        _configure_viewer(viewer, scene_spec, sapien, view_preset=viewer_preset)
+
+        while not getattr(viewer, "closed", False):
+            if step_physics:
+                scene.step()
+            scene.update_render()
+            viewer.render()
+
+        return {
+            "n_reconstructed_boxes": len(reconstructed_boxes or []),
+            "n_robot_collision_spheres": len(robot_collision_spheres or []),
+            "viewer_closed_early": bool(getattr(viewer, "closed", False)),
+        }
+    finally:
+        if viewer is not None:
+            del viewer
+        del scene
+        del sapien
 
 
 def execute_trajectory_in_sapien(

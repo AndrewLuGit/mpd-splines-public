@@ -346,14 +346,16 @@ def _matrix_to_sapien_pose(sapien_module, pose_world):
     return sapien_module.Pose(position, quaternion)
 
 
-def _build_box_actor(scene, sapien_module, box_spec, add_collision=True, color_by_source=True):
+def _build_box_actor(scene, sapien_module, box_spec, add_collision=True, color_by_source=True, color_override=None):
     center = np.asarray(box_spec["center"], dtype=float)
     size = np.asarray(box_spec["size"], dtype=float)
     half_size = (size / 2.0).tolist()
     pose_world = np.asarray(box_spec["pose_world"], dtype=float)
     source = box_spec.get("source", "environment")
 
-    if color_by_source:
+    if color_override is not None:
+        color = list(color_override)
+    elif color_by_source:
         if source == "extra":
             color = [0.85, 0.25, 0.25]
         elif source == "fixed":
@@ -442,7 +444,7 @@ def _default_panda_urdf_path():
         get_robot_path().as_posix(),
         "franka_description",
         "robots",
-        "panda_arm_hand_no_gripper.urdf",
+        "panda_arm_hand_fixed_gripper.urdf",
     )
 
 

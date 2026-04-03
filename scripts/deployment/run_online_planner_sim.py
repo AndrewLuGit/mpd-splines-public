@@ -83,6 +83,7 @@ def main():
         debug=cfg.get("debug", False),
         results_dir=results_dir,
         env_id_override=cfg.get("env_id_override", "EnvWarehouse"),
+        env_sdf_cell_size=cfg.get("env_sdf_cell_size"),
     )
 
     reference_sample = bootstrap_planner.get_reference_sample(
@@ -104,7 +105,7 @@ def main():
         extra_boxes, removed_extra_boxes = filter_box_specs_for_panda_q(
             raw_extra_boxes,
             q=q_start,
-            gripper=bool(cfg.get("start_state_filter_gripper", False)),
+            gripper=bool(cfg.get("start_state_filter_gripper", True)),
             sphere_margin=cfg.get("start_state_filter_sphere_margin", 0.0),
             box_margin=cfg.get("start_state_filter_box_margin", 0.0),
         )
@@ -112,13 +113,9 @@ def main():
         planner_filter_summary = None
         if cfg.get("planner_filter_extra_boxes_at_q_start", True):
             extra_boxes, planner_pruned_boxes, planner_filter_summary = prune_extra_boxes_for_collision_free_q_start(
-                cfg_inference_path=cfg["cfg_inference_path"],
+                planner=bootstrap_planner,
                 q_start=q_start,
                 extra_boxes=extra_boxes,
-                device=cfg.get("device", "cuda:0"),
-                debug=cfg.get("debug", False),
-                results_dir=results_dir,
-                env_id_override=cfg.get("env_id_override", "EnvWarehouse"),
                 max_removals=cfg.get("planner_filter_max_removals"),
                 mode=cfg.get("planner_filter_mode", "individual"),
             )
@@ -150,6 +147,7 @@ def main():
         debug=cfg.get("debug", False),
         results_dir=results_dir,
         env_id_override=cfg.get("env_id_override", "EnvWarehouse"),
+        env_sdf_cell_size=cfg.get("env_sdf_cell_size"),
     )
 
     print("\n----------------PHASE 1 ONLINE MPD----------------")
@@ -159,6 +157,8 @@ def main():
     print(f"q_start: {q_start}")
     print(f"ee_pose_goal: {ee_pose_goal}")
     print(f"extra_boxes: {len(extra_boxes)}")
+    if cfg.get("env_sdf_cell_size") is not None:
+        print(f"env_sdf_cell_size: {cfg['env_sdf_cell_size']}")
     if cfg.get("extra_boxes_path"):
         print(f"extra_boxes_path: {_resolve_repo_path(cfg['extra_boxes_path'])}")
     if filter_boxes_at_q_start:

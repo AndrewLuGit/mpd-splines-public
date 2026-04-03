@@ -34,7 +34,8 @@ ignore_scene_box_margin: 0.10
 ignore_boxes: []
 ignore_box_margin: 0.0
 subtract_robot: true
-robot_sphere_margin: 0.11
+robot_sphere_margin: 0.2
+inflate_robot_mask_by_voxel_extent: false
 
 # Optional MapperParams overrides. Example structure:
 mapper_params:
@@ -49,7 +50,11 @@ projection_dirname: occupancy_projections
 projection_prefix: phase3
 save_scene_debug_plot: true
 scene_debug_plot_filename: phase3_scene_debug.png
-show_scene_debug_plot: true
+show_scene_debug_plot: false
+show_scene_debug_viewer: true 
+scene_debug_add_ground: false
+scene_debug_viewer_preset: isaac_gym_default
+scene_debug_step_physics: false
 draw_occupied_voxels: true
 draw_robot_ignore_spheres: true
 scene_debug_title: Phase 3 Scene Debug
