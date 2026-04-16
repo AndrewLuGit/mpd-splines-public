@@ -14,6 +14,7 @@ import torch
 import yaml
 
 from mpd.deployment.goal_ik import build_ee_pose_goal_from_dict
+from mpd.deployment.nvblox_esdf_field import NvbloxEsdfField
 from mpd.deployment.nvblox_bridge import (
     build_robot_ignore_spheres,
     reconstruct_occupancy_from_bundle,
@@ -37,10 +38,12 @@ from mpd.deployment.sapien_depth_adapter import (
 from mpd.deployment.scene_voxelizer import save_occupancy_projections
 from mpd.deployment.sapien_trajectory_executor import (
     visualize_box_collision_debug_in_sapien,
+    visualize_esdf_debug_in_sapien,
     visualize_phase3_scene_debug_in_sapien,
 )
 from mpd.paths import REPO_PATH
 from mpd.utils.loaders import load_params_from_yaml, save_to_yaml
+from mpd.deployment.scene_voxelizer import make_voxel_grid
 from torch_robotics.torch_utils.seed import fix_random_seed
 from torch_robotics.torch_utils.torch_utils import get_torch_device, to_torch
 
@@ -138,6 +141,9 @@ def _run_capture_phase(cfg_phase2, q_start, runtime_extra_boxes):
         capture_backend=cfg_phase2.get("capture_backend", "render_camera"),
         stereo_sensor_config_overrides=cfg_phase2.get("stereo_sensor_config"),
         robot_cfg=robot_cfg,
+        mask_robot_from_depth=cfg_phase2.get("mask_robot_from_depth", False),
+        robot_depth_mask_epsilon_m=cfg_phase2.get("robot_depth_mask_epsilon_m", 0.02),
+        robot_depth_mask_dilation_px=cfg_phase2.get("robot_depth_mask_dilation_px", 0),
     )
     bundle_path = os.path.join(results_dir, cfg_phase2.get("bundle_filename", "depth_capture_bundle.npz"))
     save_depth_capture_bundle(bundle, bundle_path)
@@ -160,7 +166,7 @@ def _run_capture_phase(cfg_phase2, q_start, runtime_extra_boxes):
     }
 
 
-def _run_reconstruction_phase(cfg_phase3, bundle, scene_spec, q_start):
+def _run_reconstruction_phase(cfg_phase3, bundle, scene_spec, q_start, keep_mapper=False, update_esdf=False):
     results_dir = _resolve_repo_path(cfg_phase3["results_dir"])
     os.makedirs(results_dir, exist_ok=True)
     with open(os.path.join(results_dir, "config.yaml"), "w") as stream:
@@ -201,6 +207,8 @@ def _run_reconstruction_phase(cfg_phase3, bundle, scene_spec, q_start):
         robot_ignore_spheres=robot_ignore_spheres,
         robot_sphere_margin=0.0,
         inflate_robot_mask_by_voxel_extent=cfg_phase3.get("inflate_robot_mask_by_voxel_extent", True),
+        update_esdf=update_esdf,
+        keep_mapper=keep_mapper,
         min_component_voxels=cfg_phase3.get("min_component_voxels", 1),
         max_boxes=cfg_phase3.get("max_boxes"),
         merge_strategy=cfg_phase3.get("merge_strategy", "greedy_cuboids"),
@@ -259,10 +267,11 @@ def _run_reconstruction_phase(cfg_phase3, bundle, scene_spec, q_start):
     }
 
 
-def _run_planning_phase(cfg_phase1, q_start, ee_pose_goal, filtered_boxes, results_dir):
+def _run_planning_phase(cfg_phase1, q_start, ee_pose_goal, filtered_boxes, results_dir, extra_distance_field=None):
     planner = OnlineMPDPlanner(
         cfg_inference_path=cfg_phase1["cfg_inference_path"],
         extra_boxes=filtered_boxes,
+        extra_distance_field=extra_distance_field,
         device=cfg_phase1.get("device", "cuda:0"),
         debug=cfg_phase1.get("debug", False),
         results_dir=results_dir,
@@ -315,6 +324,33 @@ def _run_planning_phase(cfg_phase1, q_start, ee_pose_goal, filtered_boxes, resul
         raise
 
 
+def _sample_esdf_debug_points(extra_distance_field, workspace_limits, cfg_pipeline, tensor_args):
+    sample_spacing = float(cfg_pipeline.get("esdf_viewer_voxel_size", 0.10))
+    workspace_padding = float(cfg_pipeline.get("esdf_viewer_workspace_padding", 0.0))
+    voxel_grid = make_voxel_grid(workspace_limits, voxel_size=sample_spacing, padding=workspace_padding)
+    query_points = to_torch(voxel_grid.centers, **tensor_args)
+    esdf_values = extra_distance_field.compute_signed_distance(query_points)
+    if hasattr(esdf_values, "detach"):
+        esdf_values = esdf_values.detach().cpu().numpy()
+    else:
+        esdf_values = np.asarray(esdf_values, dtype=np.float32)
+
+    min_distance = float(cfg_pipeline.get("esdf_viewer_min_distance", -0.05))
+    max_distance = float(cfg_pipeline.get("esdf_viewer_max_distance", 0.15))
+    mask = (esdf_values >= min_distance) & (esdf_values <= max_distance)
+
+    sample_points = voxel_grid.centers[mask]
+    sample_values = esdf_values[mask]
+
+    max_points = cfg_pipeline.get("esdf_viewer_max_points", 5000)
+    if max_points is not None and sample_points.shape[0] > int(max_points):
+        stride = int(np.ceil(sample_points.shape[0] / int(max_points)))
+        sample_points = sample_points[::stride]
+        sample_values = sample_values[::stride]
+
+    return sample_points, sample_values
+
+
 def main():
     parser = argparse.ArgumentParser(description="Combined deployment pipeline: SAPIEN capture -> nvblox -> online planning")
     parser.add_argument(
@@ -353,6 +389,7 @@ def main():
     cfg_phase1["results_dir"] = os.path.join(base_results_dir, cfg_pipeline.get("phase1_results_subdir", "phase1_planning"))
     if cfg_phase1.get("env_sdf_cell_size") is None:
         cfg_phase1["env_sdf_cell_size"] = cfg_phase3.get("voxel_size")
+    use_nvblox_esdf_for_planning = bool(cfg_pipeline.get("use_nvblox_esdf_for_planning", False))
 
     bootstrap_planner, q_start, ee_pose_goal = _prepare_start_and_goal(
         cfg_pipeline=cfg_pipeline,
@@ -383,28 +420,72 @@ def main():
             bundle=capture_info["bundle"],
             scene_spec=capture_info["scene_spec"],
             q_start=q_start,
+            keep_mapper=use_nvblox_esdf_for_planning,
+            update_esdf=use_nvblox_esdf_for_planning,
         )
 
-        filtered_boxes, removed_boxes = filter_box_specs_for_panda_q(
-            reconstruction_info["result"].merged_boxes,
-            q=q_start,
-            gripper=bool(cfg_phase1.get("start_state_filter_gripper", True)),
-            sphere_margin=cfg_phase1.get("start_state_filter_sphere_margin", 0.0),
-            box_margin=cfg_phase1.get("start_state_filter_box_margin", 0.0),
-        )
-        planner_pruned_boxes = []
-        planner_filter_summary = None
-        if cfg_phase1.get("planner_filter_extra_boxes_at_q_start", True):
-            filtered_boxes, planner_pruned_boxes, planner_filter_summary = prune_extra_boxes_for_collision_free_q_start(
-                planner=bootstrap_planner,
-                q_start=q_start,
-                extra_boxes=filtered_boxes,
-                max_removals=cfg_phase1.get("planner_filter_max_removals"),
-                mode=cfg_phase1.get("planner_filter_mode", "individual"),
+        extra_distance_field = None
+        if use_nvblox_esdf_for_planning:
+            extra_distance_field = NvbloxEsdfField(
+                mapper=reconstruction_info["result"].mapper,
+                mapper_id=cfg_phase3.get("esdf_mapper_id", 0),
+                tensor_args=tensor_args,
+                unknown_distance=cfg_phase3.get("esdf_unknown_distance"),
+                unknown_distance_replacement=cfg_phase3.get("esdf_unknown_distance_replacement"),
             )
-            removed_boxes.extend(planner_pruned_boxes)
+            filtered_boxes = []
+            removed_boxes = []
+            planner_pruned_boxes = []
+            planner_filter_summary = {
+                "mode": "nvblox_esdf",
+                "base_metrics": None,
+                "final_metrics": None,
+                "iterations": [],
+                "used_nvblox_esdf_for_planning": True,
+            }
+            if cfg_pipeline.get("show_esdf_viewer_before_planning", False):
+                esdf_points, esdf_values = _sample_esdf_debug_points(
+                    extra_distance_field=extra_distance_field,
+                    workspace_limits=capture_info["scene_spec"]["workspace_limits"],
+                    cfg_pipeline=cfg_pipeline,
+                    tensor_args=tensor_args,
+                )
+                visualize_esdf_debug_in_sapien(
+                    scene_spec=capture_info["scene_spec"],
+                    robot_cfg={
+                        "enabled": True,
+                        "gripper": bool(cfg_phase1.get("start_state_filter_gripper", True)),
+                        "qpos": to_torch(q_start, device=torch.device("cpu"), dtype=torch.float32).tolist(),
+                    },
+                    esdf_points=esdf_points,
+                    esdf_values=esdf_values,
+                    render_viewer=True,
+                    add_ground=cfg_pipeline.get("esdf_viewer_add_ground", False),
+                    viewer_preset=cfg_pipeline.get("esdf_viewer_preset", "isaac_gym_default"),
+                    step_physics=cfg_pipeline.get("esdf_viewer_step_physics", False),
+                    point_radius=cfg_pipeline.get("esdf_viewer_point_radius", 0.015),
+                )
+        else:
+            filtered_boxes, removed_boxes = filter_box_specs_for_panda_q(
+                reconstruction_info["result"].merged_boxes,
+                q=q_start,
+                gripper=bool(cfg_phase1.get("start_state_filter_gripper", True)),
+                sphere_margin=cfg_phase1.get("start_state_filter_sphere_margin", 0.0),
+                box_margin=cfg_phase1.get("start_state_filter_box_margin", 0.0),
+            )
+            planner_pruned_boxes = []
+            planner_filter_summary = None
+            if cfg_phase1.get("planner_filter_extra_boxes_at_q_start", True):
+                filtered_boxes, planner_pruned_boxes, planner_filter_summary = prune_extra_boxes_for_collision_free_q_start(
+                    planner=bootstrap_planner,
+                    q_start=q_start,
+                    extra_boxes=filtered_boxes,
+                    max_removals=cfg_phase1.get("planner_filter_max_removals"),
+                    mode=cfg_phase1.get("planner_filter_mode", "individual"),
+                )
+                removed_boxes.extend(planner_pruned_boxes)
         pre_pruning_sapien_debug = None
-        if cfg_pipeline.get("show_pre_pruning_collision_viewer", False):
+        if cfg_pipeline.get("show_pre_pruning_collision_viewer", False) and not use_nvblox_esdf_for_planning:
             robot_collision_spheres = build_robot_ignore_spheres(
                 robot_cfg={
                     "enabled": True,
@@ -458,6 +539,7 @@ def main():
             ee_pose_goal=ee_pose_goal,
             filtered_boxes=filtered_boxes,
             results_dir=phase1_results_dir,
+            extra_distance_field=extra_distance_field,
         )
         planning_results = {
             "planner": planner,

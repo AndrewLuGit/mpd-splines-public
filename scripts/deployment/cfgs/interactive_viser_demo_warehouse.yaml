@@ -1,5 +1,5 @@
 cfg_inference_path: scripts/inference/cfgs/config_EnvWarehouse-RobotPanda-config_file_v01_00.yaml
-results_dir: logs/phase1_online_planner
+results_dir: logs/interactive_viser_demo
 
 device: cuda:0
 seed: 2
@@ -8,34 +8,19 @@ debug: false
 env_id_override: EnvWarehouse
 env_sdf_cell_size: 0.05
 
-# Leave q_start null to reuse a validation sample's start state.
-q_start: null
-
-# Leave ee_goal_pose null to reuse a validation sample's end-effector goal pose.
-# To use a manual target instead, replace null with:
-# ee_goal_pose:
-#   position: [0.55, 0.00, 0.55]
-#   orientation_euler_xyz_deg: [180.0, 0.0, -90.0]
-ee_goal_pose: null
+viser_host: 127.0.0.1
+viser_port: 8080
+viser_label: MPD Interactive Demo
 
 reference_split: validation
 reference_index: 1
 
-# Optionally replace or augment the inline boxes above with reconstructed
-# runtime boxes from Phase 3.
-extra_boxes_path: logs/phase3_nvblox_bridge/phase3_boxes.yaml
-append_extra_boxes_from_path: false
-filter_extra_boxes_at_q_start: true
-start_state_filter_gripper: true
-start_state_filter_sphere_margin: 0.0
-start_state_filter_box_margin: 0.0
-planner_filter_extra_boxes_at_q_start: true
-planner_filter_mode: individual
-planner_filter_max_removals:
-save_start_state_filtered_boxes: true
-start_state_filtered_boxes_filename: phase1_filtered_boxes.yaml
-start_state_removed_boxes_filename: phase1_removed_boxes.yaml
-planner_filter_summary_filename: phase1_planner_filter_summary.yaml
+# Leave q_start null to reuse the reference sample's start state.
+q_start: null
+
+# Leave ee_goal_pose null to reuse the reference sample's EE goal as the
+# initial gizmo pose.
+ee_goal_pose: null
 
 extra_boxes:
   - name: runtime_box_0
@@ -69,6 +54,16 @@ sapien_n_post_steps: 10
 sapien_robot:
   enabled: true
   fix_root_link: true
+
+goal_gizmo_scale: 0.22
+goal_axes_length: 0.16
+goal_axes_radius: 0.01
+show_robot_q_init: true
+show_robot_q_init_collision: false
+robot_q_init_sphere_margin: 0.0
+
+runtime_state_filename: interactive_demo_state.yaml
+plan_filename: interactive_plan.pt
 draw_collision_spheres: false
 save_ik_debug_plot_on_failure: true
 show_ik_debug_plot: false

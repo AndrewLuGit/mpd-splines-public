@@ -32,6 +32,9 @@ camera_specs:
 attempt_live_capture: true
 add_ground: false
 capture_backend: stereo_depth_sensor
+mask_robot_from_depth: true
+robot_depth_mask_epsilon_m: 0.1
+robot_depth_mask_dilation_px: 5
 
 # Optional overrides for SAPIEN's StereoDepthSensorConfig.
 # By default we keep the built-in D415-style stereo model and only match each camera's

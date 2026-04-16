@@ -74,6 +74,7 @@ def main():
     print(f"n_cameras: {len(camera_specs)}")
     print(f"capture_backend: {cfg.get('capture_backend', 'render_camera')}")
     print(f"render_robot: {cfg.get('robot', {}).get('enabled', False)}")
+    print(f"mask_robot_from_depth: {cfg.get('mask_robot_from_depth', False)}")
 
     if not cfg.get("attempt_live_capture", False):
         print("\nSkipping live capture because attempt_live_capture=false.")
@@ -88,6 +89,9 @@ def main():
         capture_backend=cfg.get("capture_backend", "render_camera"),
         stereo_sensor_config_overrides=cfg.get("stereo_sensor_config"),
         robot_cfg=cfg.get("robot"),
+        mask_robot_from_depth=cfg.get("mask_robot_from_depth", False),
+        robot_depth_mask_epsilon_m=cfg.get("robot_depth_mask_epsilon_m", 0.02),
+        robot_depth_mask_dilation_px=cfg.get("robot_depth_mask_dilation_px", 0),
     )
     bundle_path = os.path.join(results_dir, cfg.get("bundle_filename", "depth_capture_bundle.npz"))
     save_depth_capture_bundle(bundle, bundle_path)
@@ -99,6 +103,13 @@ def main():
     )
     print(f"\nSaved depth capture bundle to: {bundle_path}")
     print(f"Saved depth previews to: {preview_dir}")
+    if bundle.metadata.get("robot_depth_mask_summary"):
+        print("robot_depth_mask_summary:")
+        for item in bundle.metadata["robot_depth_mask_summary"]:
+            print(
+                f"  camera={item['camera_name']} masked_pixels={item['n_masked_pixels']} "
+                f"mask_fraction={item['mask_fraction']:.6f}"
+            )
     for frame, preview_path in zip(bundle.frames, preview_paths):
         nonzero_depth = frame.depth_meters[frame.depth_meters > 0.0]
         if nonzero_depth.size > 0:

@@ -18,6 +18,17 @@ reference_index: 1
 # If null, the pipeline uses the Phase 2 config's extra_boxes as the capture-time
 # runtime obstacles and Phase 1 consumes only the reconstructed boxes.
 runtime_extra_boxes: null
+use_nvblox_esdf_for_planning: false
+show_esdf_viewer_before_planning: false
+esdf_viewer_voxel_size: 0.10
+esdf_viewer_workspace_padding: 0.0
+esdf_viewer_min_distance: -0.05
+esdf_viewer_max_distance: 0.15
+esdf_viewer_max_points: 5000
+esdf_viewer_point_radius: 0.015
+esdf_viewer_add_ground: false
+esdf_viewer_preset: isaac_gym_default
+esdf_viewer_step_physics: false
 show_pre_pruning_collision_viewer: true
 show_noncolliding_pre_pruning_boxes: true
 pre_pruning_collision_add_ground: false

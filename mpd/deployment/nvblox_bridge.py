@@ -30,6 +30,7 @@ class NvbloxReconstructionResult:
     merged_boxes: list[dict]
     robot_ignore_spheres: list[dict]
     metadata: dict
+    mapper: object | None = None
 
 
 def require_nvblox_torch():
@@ -223,6 +224,8 @@ def reconstruct_occupancy_from_bundle(
     robot_ignore_spheres=None,
     robot_sphere_margin=0.0,
     inflate_robot_mask_by_voxel_extent=True,
+    update_esdf=False,
+    keep_mapper=False,
     min_component_voxels=1,
     max_boxes=None,
     extraction_method=None,
@@ -246,6 +249,8 @@ def reconstruct_occupancy_from_bundle(
         device=device,
         pose_convention=pose_convention,
     )
+    if update_esdf:
+        mapper.update_esdf(mapper_id=0)
 
     if extraction_method == "tsdf_sparse":
         if integrator_type != "tsdf":
@@ -345,8 +350,10 @@ def reconstruct_occupancy_from_bundle(
             "robot_sphere_margin": float(robot_sphere_margin),
             "inflate_robot_mask_by_voxel_extent": bool(inflate_robot_mask_by_voxel_extent),
             "robot_mask_voxel_extent_margin": float(robot_mask_voxel_extent_margin),
+            "update_esdf": bool(update_esdf),
             "merge_strategy": merge_strategy,
         },
+        mapper=mapper if keep_mapper else None,
     )
 
 

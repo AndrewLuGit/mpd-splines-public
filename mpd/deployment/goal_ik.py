@@ -6,6 +6,7 @@ import torch
 from scipy.spatial.transform import Rotation
 
 from torch_robotics.torch_kinematics_tree.geometrics.frame import Frame
+from torch_robotics.torch_kinematics_tree.geometrics.utils import SE3_distance
 from torch_robotics.torch_utils.torch_utils import DEFAULT_TENSOR_ARGS, to_torch
 from torch_robotics.visualizers.plot_utils import create_fig_and_axes, plot_coordinate_frame
 
@@ -86,6 +87,57 @@ def build_ee_pose_goal_from_dict(ee_goal_pose_cfg, tensor_args=DEFAULT_TENSOR_AR
     )
 
 
+def _refine_panda_goal_ik_with_collision(
+    planning_task,
+    q_candidates,
+    q_start,
+    ee_pose_goal,
+    max_iterations=80,
+    lr=5e-2,
+    se3_weight=1.0,
+    collision_weight=20.0,
+    q_start_weight=0.05,
+    debug=False,
+):
+    if q_candidates.numel() == 0 or max_iterations <= 0:
+        return q_candidates
+
+    diff_panda = planning_task.robot.diff_panda
+    link_name = planning_task.robot.link_name_ee
+    lower, upper, _, _ = diff_panda.get_joint_limit_array()
+    lower = to_torch(lower, **planning_task.tensor_args)
+    upper = to_torch(upper, **planning_task.tensor_args)
+
+    q_refined = q_candidates.detach().clone().requires_grad_(True)
+    optimizer = torch.optim.Adam([q_refined], lr=lr)
+    q_start_expanded = q_start.unsqueeze(0).expand_as(q_refined)
+    ee_pose_goal_expanded = ee_pose_goal.unsqueeze(0).expand(q_refined.shape[0], -1, -1)
+
+    for iter_idx in range(max_iterations):
+        optimizer.zero_grad()
+        H = diff_panda.compute_forward_kinematics_all_links(q_refined, link_list=[link_name]).squeeze(1)
+        err_se3 = SE3_distance(H, ee_pose_goal_expanded, w_pos=1.0, w_rot=1.0)
+        collision_cost = planning_task.compute_collision_cost(q_refined).reshape(-1)
+        err_q_start = torch.linalg.norm(q_refined - q_start_expanded, dim=-1)
+        loss_per_q = se3_weight * err_se3 + collision_weight * collision_cost + q_start_weight * err_q_start
+        loss = loss_per_q.sum()
+        loss.backward()
+        optimizer.step()
+        with torch.no_grad():
+            q_refined.clamp_(lower, upper)
+
+        if debug and (iter_idx == 0 or iter_idx == max_iterations - 1):
+            print(
+                "IK collision refine "
+                f"iter={iter_idx} "
+                f"se3_mean={float(err_se3.mean()):.4f} "
+                f"coll_mean={float(collision_cost.mean()):.4f} "
+                f"qstart_mean={float(err_q_start.mean()):.4f}"
+            )
+
+    return q_refined.detach()
+
+
 def solve_panda_goal_ik(
     planning_task,
     q_start,
@@ -96,6 +148,11 @@ def solve_panda_goal_ik(
     se3_eps=5e-2,
     q0_noise=torch.pi / 8,
     max_candidates=8,
+    collision_refine_max_iterations=80,
+    collision_refine_lr=5e-2,
+    collision_refine_se3_weight=1.0,
+    collision_refine_weight=20.0,
+    collision_refine_q_start_weight=0.05,
     debug=False,
     return_debug_data=False,
 ):
@@ -127,7 +184,11 @@ def solve_panda_goal_ik(
         q_solutions_all=q_solutions.detach().clone(),
         idx_valid_ik=idx_valid.detach().clone(),
         q_candidates_ik_valid=torch.empty((0, planning_task.robot.q_dim), **planning_task.tensor_args),
+        q_candidates_ik_refined=torch.empty((0, planning_task.robot.q_dim), **planning_task.tensor_args),
+        refined_se3_error=torch.empty((0,), **planning_task.tensor_args),
+        idx_valid_refined_se3=torch.empty((0,), dtype=torch.long, device=planning_task.tensor_args["device"]),
         in_collision_ik_valid=torch.empty((0,), dtype=torch.bool, device=planning_task.tensor_args["device"]),
+        in_collision_ik_refined=torch.empty((0,), dtype=torch.bool, device=planning_task.tensor_args["device"]),
         q_candidates_collision_free=torch.empty((0, planning_task.robot.q_dim), **planning_task.tensor_args),
         q_candidates_colliding=torch.empty((0, planning_task.robot.q_dim), **planning_task.tensor_args),
         q_candidates_selected=torch.empty((0, planning_task.robot.q_dim), **planning_task.tensor_args),
@@ -141,8 +202,40 @@ def solve_panda_goal_ik(
 
     q_candidates = q_solutions[idx_valid]
     debug_data["q_candidates_ik_valid"] = q_candidates.detach().clone()
+    q_candidates_refined = _refine_panda_goal_ik_with_collision(
+        planning_task,
+        q_candidates=q_candidates,
+        q_start=q_start,
+        ee_pose_goal=ee_pose_goal,
+        max_iterations=collision_refine_max_iterations,
+        lr=collision_refine_lr,
+        se3_weight=collision_refine_se3_weight,
+        collision_weight=collision_refine_weight,
+        q_start_weight=collision_refine_q_start_weight,
+        debug=debug,
+    )
+    debug_data["q_candidates_ik_refined"] = q_candidates_refined.detach().clone()
+
+    H_refined = planning_task.robot.diff_panda.compute_forward_kinematics_all_links(
+        q_candidates_refined,
+        link_list=[planning_task.robot.link_name_ee],
+    ).squeeze(1)
+    ee_pose_goal_expanded = ee_pose_goal.unsqueeze(0).expand(q_candidates_refined.shape[0], -1, -1)
+    refined_se3_error = SE3_distance(H_refined, ee_pose_goal_expanded, w_pos=1.0, w_rot=1.0)
+    debug_data["refined_se3_error"] = refined_se3_error.detach().clone()
+    idx_valid_refined_se3 = torch.argwhere(refined_se3_error < se3_eps).reshape(-1)
+    debug_data["idx_valid_refined_se3"] = idx_valid_refined_se3.detach().clone()
+
+    if idx_valid_refined_se3.numel() == 0:
+        empty = torch.empty((0, planning_task.robot.q_dim), **planning_task.tensor_args)
+        if return_debug_data:
+            return empty, debug_data
+        return empty
+
+    q_candidates = q_candidates_refined[idx_valid_refined_se3]
     in_collision = planning_task.compute_collision(q_candidates).bool().reshape(-1)
-    debug_data["in_collision_ik_valid"] = in_collision.detach().clone()
+    debug_data["in_collision_ik_valid"] = planning_task.compute_collision(debug_data["q_candidates_ik_valid"]).bool().reshape(-1).detach().clone()
+    debug_data["in_collision_ik_refined"] = in_collision.detach().clone()
     debug_data["q_candidates_colliding"] = q_candidates[in_collision].detach().clone()
     q_candidates = q_candidates[~in_collision]
     debug_data["q_candidates_collision_free"] = q_candidates.detach().clone()

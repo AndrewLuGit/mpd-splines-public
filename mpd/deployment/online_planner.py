@@ -101,11 +101,12 @@ def compute_q_collision_breakdown(planner, q):
     object_metrics = field_metrics(planning_task.get_collision_objects_field())
     ws_metrics = field_metrics(planning_task.get_collision_ws_boundaries_field())
 
+    has_extra_collision_source = bool(env.get_obj_extra_list()) or getattr(env, "grid_map_sdf_obj_extra", None) is not None
     extra_metrics = {"colliding": False, "cost": 0.0}
-    if planning_task.get_collision_extra_objects_field() is not None and env.get_obj_extra_list():
+    if planning_task.get_collision_extra_objects_field() is not None and has_extra_collision_source:
         extra_metrics = field_metrics(planning_task.get_collision_extra_objects_field())
 
-    if env.get_obj_extra_list():
+    if has_extra_collision_source:
         with _temporary_env_extra_boxes(env, []):
             fixed_object_metrics = field_metrics(planning_task.get_collision_objects_field())
     else:
@@ -153,6 +154,7 @@ class OnlineMPDPlanner:
         self,
         cfg_inference_path,
         extra_boxes=None,
+        extra_distance_field=None,
         device="cuda:0",
         debug=False,
         results_dir="logs/phase1_online_planner",
@@ -189,6 +191,9 @@ class OnlineMPDPlanner:
         self.args_train.update(**update_kwargs)
 
         self.planning_task, self.train_subset, _, self.val_subset, _ = get_planning_task_and_dataset(**self.args_train)
+        self.extra_distance_field = extra_distance_field
+        if self.extra_distance_field is not None:
+            self.planning_task.env.grid_map_sdf_obj_extra = self.extra_distance_field
         self.dataset = self.train_subset.dataset
         self.generative_optimization_planner = GenerativeOptimizationPlanner(
             self.planning_task,
@@ -201,6 +206,15 @@ class OnlineMPDPlanner:
         self.planning_metrics_calculator = PlanningMetricsCalculator(self.planning_task)
         self.last_ik_debug_data = None
         self.last_q_collision_debug = None
+
+    def update_extra_boxes(self, extra_boxes):
+        self.extra_object_fields = build_object_fields_from_boxes(extra_boxes, tensor_args=self.tensor_args)
+        self.planning_task.env.set_obj_extra_list(self.extra_object_fields)
+        if self.extra_distance_field is not None:
+            self.planning_task.env.grid_map_sdf_obj_extra = self.extra_distance_field
+        else:
+            self.planning_task.env.grid_map_sdf_obj_extra = None
+            self.planning_task.env.update_objects_extra()
 
     def get_reference_sample(self, index=0, selection="validation"):
         subset = self.val_subset if selection == "validation" else self.train_subset

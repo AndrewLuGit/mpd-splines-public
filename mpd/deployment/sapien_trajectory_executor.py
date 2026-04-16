@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from dataclasses import asdict
+import gc
 
+import matplotlib.pyplot as plt
 import numpy as np
 
 from mpd.deployment.sapien_depth_adapter import (
@@ -127,6 +129,85 @@ def _add_sphere_actor(scene, sapien_module, sphere_spec, color=(0.15, 0.8, 0.2))
     pose[:3, 3] = center
     actor.set_pose(_matrix_to_sapien_pose(sapien_module, pose))
     return actor
+
+
+def visualize_esdf_debug_in_sapien(
+    scene_spec,
+    robot_cfg,
+    esdf_points,
+    esdf_values,
+    render_viewer=True,
+    add_ground=False,
+    viewer_preset="isaac_gym_default",
+    step_physics=False,
+    point_radius=0.015,
+):
+    esdf_points = np.asarray(esdf_points, dtype=np.float32)
+    esdf_values = np.asarray(esdf_values, dtype=np.float32).reshape(-1)
+
+    if esdf_points.ndim != 2 or esdf_points.shape[1] != 3:
+        raise ValueError(f"Expected esdf_points with shape (N, 3), got {esdf_points.shape}")
+    if esdf_points.shape[0] != esdf_values.shape[0]:
+        raise ValueError(
+            f"esdf_points/esdf_values size mismatch: {esdf_points.shape[0]} vs {esdf_values.shape[0]}"
+        )
+
+    if not render_viewer:
+        return {
+            "n_esdf_points": int(esdf_points.shape[0]),
+            "esdf_min": float(esdf_values.min()) if esdf_values.size else 0.0,
+            "esdf_max": float(esdf_values.max()) if esdf_values.size else 0.0,
+        }
+
+    sapien, scene, _ = _create_scene(scene_spec=scene_spec, add_ground=add_ground)
+    viewer = None
+    try:
+        robot_cfg = dict(robot_cfg or {})
+        robot_cfg["enabled"] = True
+        _load_robot_articulation(scene, sapien, robot_cfg)
+
+        if esdf_values.size:
+            esdf_min = float(esdf_values.min())
+            esdf_max = float(esdf_values.max())
+            denom = max(esdf_max - esdf_min, 1e-6)
+            colors = plt.get_cmap("plasma")((esdf_values - esdf_min) / denom)[:, :3]
+        else:
+            esdf_min = 0.0
+            esdf_max = 0.0
+            colors = np.zeros((0, 3), dtype=np.float32)
+
+        for idx, (point, color) in enumerate(zip(esdf_points, colors)):
+            _add_sphere_actor(
+                scene,
+                sapien,
+                {
+                    "name": f"esdf_debug_point_{idx}",
+                    "center": point.tolist(),
+                    "radius": float(point_radius),
+                },
+                color=tuple(float(v) for v in color),
+            )
+
+        viewer = scene.create_viewer()
+        _configure_viewer(viewer, scene_spec, sapien, view_preset=viewer_preset)
+
+        while not getattr(viewer, "closed", False):
+            if step_physics:
+                scene.step()
+            scene.update_render()
+            viewer.render()
+
+        return {
+            "n_esdf_points": int(esdf_points.shape[0]),
+            "esdf_min": esdf_min,
+            "esdf_max": esdf_max,
+            "viewer_closed_early": bool(getattr(viewer, "closed", False)),
+        }
+    finally:
+        if viewer is not None:
+            del viewer
+        del scene
+        del sapien
 
 
 def visualize_box_collision_debug_in_sapien(
@@ -397,3 +478,174 @@ def execute_trajectory_in_sapien(
             del viewer
         del scene
         del sapien
+
+
+class PersistentSapienTrajectoryExecutor:
+    def __init__(self, viewer_preset="isaac_gym_default"):
+        self.viewer_preset = viewer_preset
+        self.viewer = None
+        self.scene = None
+        self.sapien = None
+
+    def close(self):
+        if self.viewer is not None:
+            del self.viewer
+            self.viewer = None
+        if self.scene is not None:
+            del self.scene
+            self.scene = None
+        self.sapien = None
+        gc.collect()
+
+    def execute_trajectory(
+        self,
+        q_traj,
+        timesteps,
+        scene_spec,
+        robot_cfg=None,
+        render_viewer=True,
+        add_ground=False,
+        scene_timestep=1.0 / 240.0,
+        render_every_n_steps=4,
+        stiffness=200.0,
+        damping=40.0,
+        force_limit=1000.0,
+        drive_mode="force",
+        balance_passive_force=True,
+        compensate_gravity=True,
+        compensate_coriolis_and_centrifugal=True,
+        n_pre_steps=5,
+        n_post_steps=10,
+        viewer_preset=None,
+    ):
+        q_traj_np = _as_numpy_trajectory(q_traj)
+        timesteps_np = _as_numpy_timesteps(
+            timesteps=timesteps,
+            num_points=q_traj_np.shape[0],
+            trajectory_duration=max(float(q_traj_np.shape[0] - 1), 1.0),
+        )
+
+        robot_cfg = dict(robot_cfg or {})
+        robot_cfg["enabled"] = True
+        robot_cfg["fix_root_link"] = bool(robot_cfg.get("fix_root_link", True))
+        robot_cfg["qpos"] = q_traj_np[0].tolist()
+
+        new_sapien, new_scene, _ = _create_scene(scene_spec=scene_spec, add_ground=add_ground)
+        new_scene.set_timestep(float(scene_timestep))
+        robot = _load_robot_articulation(new_scene, new_sapien, robot_cfg)
+        if robot is None:
+            del new_scene
+            raise RuntimeError("Failed to create the SAPIEN robot articulation for trajectory replay")
+
+        if q_traj_np.shape[1] != robot.dof:
+            del new_scene
+            raise ValueError(
+                f"Trajectory dof mismatch: planner produced {q_traj_np.shape[1]} joints but SAPIEN robot has {robot.dof}"
+            )
+
+        if hasattr(robot, "set_qvel"):
+            robot.set_qvel(np.zeros((robot.dof,), dtype=np.float32))
+
+        active_joints = robot.get_active_joints()
+        if len(active_joints) != robot.dof:
+            del new_scene
+            raise RuntimeError(
+                f"Unexpected active joint count for replay: expected {robot.dof}, got {len(active_joints)}"
+            )
+
+        stiffness_per_joint = _expand_joint_parameter(stiffness, robot.dof, "stiffness")
+        damping_per_joint = _expand_joint_parameter(damping, robot.dof, "damping")
+        force_limit_per_joint = _expand_joint_parameter(force_limit, robot.dof, "force_limit")
+
+        for joint_idx, joint in enumerate(active_joints):
+            joint.set_drive_property(
+                stiffness=float(stiffness_per_joint[joint_idx]),
+                damping=float(damping_per_joint[joint_idx]),
+                force_limit=float(force_limit_per_joint[joint_idx]),
+                mode=str(drive_mode),
+            )
+
+        old_scene = self.scene
+        self.scene = new_scene
+        self.sapien = new_sapien
+
+        if render_viewer:
+            if self.viewer is None or getattr(self.viewer, "closed", False):
+                self.viewer = new_scene.create_viewer()
+            else:
+                self.viewer.set_scene(new_scene)
+            _configure_viewer(
+                self.viewer,
+                scene_spec,
+                new_sapien,
+                view_preset=viewer_preset or self.viewer_preset,
+            )
+
+        if old_scene is not None:
+            del old_scene
+
+        q_target_history = []
+        tracking_error_history = []
+        sim_steps = 0
+
+        def _step_once(q_target):
+            nonlocal sim_steps
+            _set_drive_targets(active_joints, q_target)
+            if balance_passive_force:
+                qf = robot.compute_passive_force(
+                    gravity=bool(compensate_gravity),
+                    coriolis_and_centrifugal=bool(compensate_coriolis_and_centrifugal),
+                )
+                robot.set_qf(np.asarray(qf, dtype=np.float32))
+            new_scene.step()
+            sim_steps += 1
+            qpos = np.asarray(robot.get_qpos(), dtype=np.float32)
+            q_target_history.append(np.asarray(q_target, dtype=np.float32))
+            tracking_error_history.append(float(np.linalg.norm(qpos - q_target)))
+            if self.viewer is not None and sim_steps % max(int(render_every_n_steps), 1) == 0:
+                new_scene.update_render()
+                self.viewer.render()
+
+        for _ in range(max(int(n_pre_steps), 0)):
+            if self.viewer is not None and getattr(self.viewer, "closed", False):
+                break
+            _step_once(q_traj_np[0])
+
+        for waypoint_idx in range(q_traj_np.shape[0] - 1):
+            if self.viewer is not None and getattr(self.viewer, "closed", False):
+                break
+            q_start = q_traj_np[waypoint_idx]
+            q_goal = q_traj_np[waypoint_idx + 1]
+            dt_segment = float(timesteps_np[waypoint_idx + 1] - timesteps_np[waypoint_idx])
+            n_segment_steps = _compute_segment_step_count(dt_segment, float(scene_timestep))
+            for step_idx in range(n_segment_steps):
+                if self.viewer is not None and getattr(self.viewer, "closed", False):
+                    break
+                alpha = float(step_idx + 1) / float(n_segment_steps)
+                q_target = (1.0 - alpha) * q_start + alpha * q_goal
+                _step_once(q_target)
+
+        for _ in range(max(int(n_post_steps), 0)):
+            if self.viewer is not None and getattr(self.viewer, "closed", False):
+                break
+            _step_once(q_traj_np[-1])
+
+        if self.viewer is not None:
+            new_scene.update_render()
+            self.viewer.render()
+
+        q_target_history = np.asarray(q_target_history, dtype=np.float32)
+        tracking_error_history = np.asarray(tracking_error_history, dtype=np.float32)
+
+        return {
+            "scene_timestep": float(scene_timestep),
+            "trajectory_duration": float(timesteps_np[-1] - timesteps_np[0]) if timesteps_np.size > 1 else 0.0,
+            "num_waypoints": int(q_traj_np.shape[0]),
+            "num_sim_steps": int(sim_steps),
+            "max_tracking_error_l2": float(np.max(tracking_error_history)) if tracking_error_history.size else 0.0,
+            "mean_tracking_error_l2": float(np.mean(tracking_error_history)) if tracking_error_history.size else 0.0,
+            "final_tracking_error_l2": float(tracking_error_history[-1]) if tracking_error_history.size else 0.0,
+            "final_qpos": np.asarray(robot.get_qpos(), dtype=np.float32).tolist(),
+            "final_q_target": q_target_history[-1].tolist() if q_target_history.size else q_traj_np[-1].tolist(),
+            "viewer_closed_early": bool(self.viewer is not None and getattr(self.viewer, "closed", False)),
+        }

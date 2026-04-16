@@ -299,6 +299,40 @@ def save_depth_preview_images(bundle: DepthCaptureBundle, output_dir, cmap="viri
     return saved_paths
 
 
+def _dilate_mask(mask, dilation_px):
+    dilation_px = int(dilation_px)
+    if dilation_px <= 0:
+        return mask
+
+    try:
+        from scipy import ndimage
+    except ModuleNotFoundError as exc:
+        raise ModuleNotFoundError(
+            "scipy is required for robot depth mask dilation. Install scipy or set robot_depth_mask_dilation_px: 0."
+        ) from exc
+
+    structure = np.ones((2 * dilation_px + 1, 2 * dilation_px + 1), dtype=bool)
+    return ndimage.binary_dilation(mask, structure=structure)
+
+
+def _apply_robot_depth_mask(depth_meters, robot_depth_meters, depth_epsilon_m=0.02, dilation_px=0):
+    depth_meters = np.asarray(depth_meters, dtype=np.float32)
+    robot_depth_meters = np.asarray(robot_depth_meters, dtype=np.float32)
+    if depth_meters.shape != robot_depth_meters.shape:
+        raise ValueError(
+            f"Depth and robot depth shapes must match, got {depth_meters.shape} and {robot_depth_meters.shape}"
+        )
+
+    valid_depth = np.isfinite(depth_meters) & (depth_meters > 0.0)
+    valid_robot = np.isfinite(robot_depth_meters) & (robot_depth_meters > 0.0)
+    robot_mask = valid_depth & valid_robot & (np.abs(depth_meters - robot_depth_meters) <= float(depth_epsilon_m))
+    robot_mask = _dilate_mask(robot_mask, dilation_px)
+
+    depth_masked = depth_meters.copy()
+    depth_masked[robot_mask] = 0.0
+    return depth_masked, robot_mask
+
+
 def _make_fovy_from_intrinsics(camera_spec: DepthCameraSpec):
     intrinsics = camera_spec.resolved_intrinsics()
     fy = intrinsics["fy"]
@@ -480,7 +514,7 @@ def _load_robot_articulation(scene, sapien_module, robot_cfg):
     return articulation
 
 
-def _create_scene(scene_spec, add_ground=False):
+def _create_scene(scene_spec, add_ground=False, include_scene_boxes=True):
     sapien = require_sapien()
 
     try:
@@ -502,8 +536,9 @@ def _create_scene(scene_spec, add_ground=False):
     scene.add_point_light([0.2, 1.2, 1.8], [0.8, 0.8, 0.8], shadow=False)
 
     actors = []
-    for box_spec in scene_spec["boxes"]:
-        actors.append(_build_box_actor(scene, sapien, box_spec))
+    if include_scene_boxes:
+        for box_spec in scene_spec["boxes"]:
+            actors.append(_build_box_actor(scene, sapien, box_spec))
 
     return sapien, scene, actors
 
@@ -550,8 +585,13 @@ def _create_scene_and_capturers(
     capture_backend="render_camera",
     stereo_sensor_config_overrides=None,
     robot_cfg=None,
+    include_scene_boxes=True,
 ):
-    sapien, scene, actors = _create_scene(scene_spec=scene_spec, add_ground=add_ground)
+    sapien, scene, actors = _create_scene(
+        scene_spec=scene_spec,
+        add_ground=add_ground,
+        include_scene_boxes=include_scene_boxes,
+    )
     robot = _load_robot_articulation(scene, sapien, robot_cfg)
 
     if capture_backend == "render_camera":
@@ -588,6 +628,48 @@ def _capture_depth_with_render_cameras(scene_spec, camera_specs, add_ground=Fals
         add_ground=add_ground,
         capture_backend="render_camera",
         robot_cfg=robot_cfg,
+    )
+
+    try:
+        scene.step()
+        scene.update_render()
+        frames = []
+        for capturer, camera_spec in zip(capturers, camera_specs):
+            capturer.take_picture()
+            position_picture = capturer.get_picture("Position")
+            depth_meters = _depth_from_position_picture(
+                position_picture,
+                near=float(camera_spec.near),
+                far=float(camera_spec.far),
+            )
+            frames.append(
+                DepthFrame(
+                    camera_name=camera_spec.name,
+                    depth_meters=depth_meters,
+                    intrinsic_matrix=np.asarray(capturer.get_intrinsic_matrix(), dtype=np.float32),
+                    pose_world=np.asarray(capturer.entity.pose.to_transformation_matrix(), dtype=np.float32),
+                )
+            )
+    finally:
+        del capturers
+        del robot
+        del scene
+        del sapien
+
+    return frames
+
+
+def _capture_robot_only_depth_with_render_cameras(scene_spec, camera_specs, add_ground=False, robot_cfg=None):
+    if not robot_cfg or not robot_cfg.get("enabled", False):
+        return []
+
+    sapien, scene, _, capturers, robot = _create_scene_and_capturers(
+        scene_spec=scene_spec,
+        camera_specs=camera_specs,
+        add_ground=add_ground,
+        capture_backend="render_camera",
+        robot_cfg=robot_cfg,
+        include_scene_boxes=False,
     )
 
     try:
@@ -668,6 +750,9 @@ def capture_depth_with_sapien(
     capture_backend="render_camera",
     stereo_sensor_config_overrides=None,
     robot_cfg=None,
+    mask_robot_from_depth=False,
+    robot_depth_mask_epsilon_m=0.02,
+    robot_depth_mask_dilation_px=0,
 ):
     try:
         if capture_backend == "render_camera":
@@ -695,7 +780,55 @@ def capture_depth_with_sapien(
             "SAPIEN scene creation succeeded, but depth capture failed while updating render or reading camera outputs."
         ) from exc
 
+    robot_mask_summary = None
+    if mask_robot_from_depth and robot_cfg and robot_cfg.get("enabled", False):
+        robot_only_frames = _capture_robot_only_depth_with_render_cameras(
+            scene_spec=scene_spec,
+            camera_specs=camera_specs,
+            add_ground=add_ground,
+            robot_cfg=robot_cfg,
+        )
+        robot_frame_map = {frame.camera_name: frame for frame in robot_only_frames}
+        robot_mask_summary = []
+        masked_frames = []
+        for frame in frames:
+            robot_frame = robot_frame_map.get(frame.camera_name)
+            if robot_frame is None:
+                masked_frames.append(frame)
+                continue
+
+            masked_depth, robot_mask = _apply_robot_depth_mask(
+                depth_meters=frame.depth_meters,
+                robot_depth_meters=robot_frame.depth_meters,
+                depth_epsilon_m=robot_depth_mask_epsilon_m,
+                dilation_px=robot_depth_mask_dilation_px,
+            )
+            robot_mask_summary.append(
+                {
+                    "camera_name": frame.camera_name,
+                    "n_masked_pixels": int(robot_mask.sum()),
+                    "mask_fraction": float(robot_mask.mean()),
+                }
+            )
+            masked_frames.append(
+                DepthFrame(
+                    camera_name=frame.camera_name,
+                    depth_meters=masked_depth,
+                    intrinsic_matrix=frame.intrinsic_matrix,
+                    pose_world=frame.pose_world,
+                )
+            )
+        frames = masked_frames
+
     return DepthCaptureBundle(
         frames=frames,
-        metadata={**(metadata or {}), "capture_backend": capture_backend},
+        metadata={
+            **(metadata or {}),
+            "capture_backend": capture_backend,
+            "robot_depth_mask_applied": bool(mask_robot_from_depth and robot_cfg and robot_cfg.get("enabled", False)),
+            "robot_depth_mask_backend": "render_camera" if mask_robot_from_depth else None,
+            "robot_depth_mask_epsilon_m": float(robot_depth_mask_epsilon_m),
+            "robot_depth_mask_dilation_px": int(robot_depth_mask_dilation_px),
+            "robot_depth_mask_summary": robot_mask_summary,
+        },
     )

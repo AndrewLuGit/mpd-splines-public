@@ -93,11 +93,10 @@ class EnvBase(ABC):
                 df_obj_l.extend(self.obj_fixed_list)
 
         # obj_extra_list objects
-        if self.obj_extra_list:
-            if self.grid_map_sdf_obj_extra is not None:
-                df_obj_l.append(self.grid_map_sdf_obj_extra)
-            else:
-                df_obj_l.extend(self.obj_extra_list)
+        if self.grid_map_sdf_obj_extra is not None:
+            df_obj_l.append(self.grid_map_sdf_obj_extra)
+        elif self.obj_extra_list:
+            df_obj_l.extend(self.obj_extra_list)
 
         return df_obj_l
 
@@ -208,7 +207,7 @@ class EnvBase(ABC):
 
         # compute sdf of extra objects
         sdf_extra_objects = None
-        if self.obj_extra_list:
+        if self.grid_map_sdf_obj_extra is not None or self.obj_extra_list:
             if self.grid_map_sdf_obj_extra is not None:
                 sdf_extra_objects = self.grid_map_sdf_obj_extra(x)
                 if reshape_shape:
