@@ -57,7 +57,11 @@ import torch
 import numpy as np
 from torch.autograd.functional import jacobian
 
-from torch_robotics.torch_kinematics_tree.geometrics.quaternion import q_to_axis_angles, q_div, q_convert_to_wxyz
+from torch_robotics.torch_kinematics_tree.geometrics.quaternion import (
+    q_to_axis_angles,
+    q_convert_to_wxyz,
+    rotation_matrix_to_q,
+)
 from torch_robotics.torch_kinematics_tree.geometrics.skeleton import get_skeleton_from_model
 from torch_robotics.torch_kinematics_tree.models.rigid_body import DifferentiableRigidBody
 from torch_robotics.torch_kinematics_tree.models.utils import URDFRobotModel, MJCFRobotModel
@@ -67,6 +71,7 @@ from torch_robotics.torch_kinematics_tree.geometrics.utils import (
     link_pos_from_link_tensor,
     link_quat_from_link_tensor,
     link_rot_from_link_tensor,
+    vector3_to_skew_symm_matrix,
 )
 from torch_robotics.torch_utils.torch_utils import to_torch, torch_intersect_1d
 
@@ -126,6 +131,8 @@ class DifferentiableTree(torch.nn.Module):
             body.set_parent(self._bodies[parent_body_idx])
             self._bodies[parent_body_idx].add_child(body)
 
+        self._ik_joint_path_cache = {}
+
     def reset(self):
         """Reset the robots FK after stateful update"""
         for body in self._bodies:
@@ -155,9 +162,18 @@ class DifferentiableTree(torch.nn.Module):
         for i in range(q.shape[1]):
             idx = self._controlled_joints[i]
             self._bodies[idx].update_joint_state(q[:, i].unsqueeze(1), qd[:, i].unsqueeze(1))
+        for body in self._bodies:
+            if body.joint_idx is None:
+                zeros = torch.zeros((batch_size, 1), device=self._device, dtype=q.dtype)
+                body.update_joint_state(zeros, zeros)
 
         # we assume a non-moving base
         parent_body = self._bodies[0]
+        parent_body.pose = parent_body.pose.__class__(
+            rot=parent_body.pose.rotation[:1].repeat(batch_size, 1, 1),
+            trans=parent_body.pose.translation[:1].repeat(batch_size, 1),
+            device=self._device,
+        )
         parent_body.vel = MotionVec(
             torch.zeros((batch_size, 3), device=self._device),
             torch.zeros((batch_size, 3), device=self._device),
@@ -241,10 +257,112 @@ class DifferentiableTree(torch.nn.Module):
             axis_idx = self._bodies[idx].axis_idx
             p_i = pose.translation
             z_i = torch.index_select(pose.rotation, -1, axis_idx).squeeze(-1)
-            lin_jac[:, :, i] = torch.cross(z_i, ee_pos - p_i)
+            lin_jac[:, :, i] = torch.linalg.cross(z_i, ee_pos - p_i, dim=-1)
             ang_jac[:, :, i] = z_i
 
         return ee_pos, ee_rot, lin_jac, ang_jac
+
+    def _get_ik_joint_path(self, link_name: str):
+        if link_name in self._ik_joint_path_cache:
+            return self._ik_joint_path_cache[link_name]
+
+        path = []
+        body = self._bodies[self._name_to_idx_map[link_name]]
+        while not body.is_root:
+            if body.joint_idx is not None:
+                body_idx = self._name_to_idx_map[body.name]
+                path.append((body.joint_idx, body_idx))
+            body = body._parent
+
+        path.reverse()
+        self._ik_joint_path_cache[link_name] = path
+        return path
+
+    def compute_forward_kinematics_and_geometric_jacobian_stateless(
+        self, q: torch.Tensor, link_name: str
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        if q.ndim == 1:
+            q = q.unsqueeze(0)
+
+        batch_size = q.shape[0]
+        q_dict = {}
+        for i, body_idx in enumerate(self._controlled_joints):
+            q_dict[self._bodies[body_idx].name] = q[:, i].unsqueeze(1)
+
+        pose_dict = self._bodies[0].forward_kinematics(q_dict, batch_size)
+        ee_pose = pose_dict[link_name]
+        ee_pos = ee_pose.translation
+        ee_rot = ee_pose.rotation
+
+        lin_jac = torch.zeros((batch_size, 3, self._n_dofs), device=self._device, dtype=q.dtype)
+        ang_jac = torch.zeros((batch_size, 3, self._n_dofs), device=self._device, dtype=q.dtype)
+
+        for joint_idx, body_idx in self._get_ik_joint_path(link_name):
+            body = self._bodies[body_idx]
+            pose = pose_dict[body.name]
+            axis_idx = int(body.axis_idx.item())
+            axis_sign = body.joint_axis[0, axis_idx].to(device=q.device, dtype=q.dtype)
+            axis_world = axis_sign * pose.rotation[:, :, axis_idx]
+
+            if body.joint_type in ["revolute", "continuous"]:
+                lin_jac[:, :, joint_idx] = torch.linalg.cross(axis_world, ee_pos - pose.translation, dim=-1)
+                ang_jac[:, :, joint_idx] = axis_world
+            elif body.joint_type == "prismatic":
+                lin_jac[:, :, joint_idx] = axis_world
+
+        return ee_pos, ee_rot, lin_jac, ang_jac
+
+    def _compute_so3_log_and_jacobian(self, error_rot: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        quat_error = rotation_matrix_to_q(error_rot)
+        ori_residual = q_to_axis_angles(quat_error)
+
+        omega_hat = vector3_to_skew_symm_matrix(ori_residual).to(device=error_rot.device, dtype=error_rot.dtype)
+        omega_hat_sq = omega_hat @ omega_hat
+
+        batch_size = error_rot.shape[0]
+        identity = torch.eye(3, device=error_rot.device, dtype=error_rot.dtype).unsqueeze(0).repeat(batch_size, 1, 1)
+
+        theta = torch.linalg.norm(ori_residual, dim=-1, keepdim=True)
+        theta_sq = theta.pow(2)
+        small_mask = theta.squeeze(-1) < 1e-4
+
+        coeff = torch.empty((batch_size, 1, 1), device=error_rot.device, dtype=error_rot.dtype)
+        coeff[small_mask] = (1.0 / 12.0) + (theta_sq[small_mask].unsqueeze(-1) / 720.0)
+
+        theta_ns = theta[~small_mask]
+        coeff[~small_mask] = (
+            (1.0 / theta_sq[~small_mask]).unsqueeze(-1)
+            - ((1.0 + torch.cos(theta_ns)) / (2.0 * theta_ns * torch.sin(theta_ns))).unsqueeze(-1)
+        )
+
+        jr_inv = identity + 0.5 * omega_hat + coeff * omega_hat_sq
+        return ori_residual, jr_inv
+
+    def compute_ik_residual_and_analytic_jacobian(
+        self, q: torch.Tensor, H_target: torch.Tensor, link_name: str
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if q.ndim == 1:
+            q = q.unsqueeze(0)
+        if H_target.ndim == 2:
+            H_target = H_target.unsqueeze(0)
+
+        ee_pos, ee_rot, lin_jac_world, ang_jac_world = self.compute_forward_kinematics_and_geometric_jacobian_stateless(
+            q, link_name
+        )
+
+        target_pos = H_target[:, :3, 3]
+        target_rot = H_target[:, :3, :3]
+
+        pos_residual = ee_pos - target_pos
+        error_rot = target_rot.transpose(-2, -1) @ ee_rot
+        ori_residual, jr_inv = self._compute_so3_log_and_jacobian(error_rot)
+
+        ang_jac_body = ee_rot.transpose(-2, -1) @ ang_jac_world
+        ori_jac = jr_inv @ ang_jac_body
+
+        residual = torch.cat((pos_residual, ori_residual), dim=-1)
+        jacobian_analytic = torch.cat((lin_jac_world, ori_jac), dim=-2)
+        return residual, jacobian_analytic
 
     def compute_analytical_jacobian_all_links(self, q: torch.Tensor):
         # Batch computation of analytical jacobian for all links
@@ -313,7 +431,7 @@ class DifferentiableTree(torch.nn.Module):
         debug=False,
     ):
         """
-        Solve IK using Adam optimizer
+        Solve IK using Levenberg-Marquardt with an analytic Jacobian
         Args:
             H_target: target SE3 matrix [batch_size x 4 x 4]
             num_iters: number of iterations
@@ -332,57 +450,102 @@ class DifferentiableTree(torch.nn.Module):
         upper -= eps_joint_lim
         lower = to_torch(lower, device=self._device)
         upper = to_torch(upper, device=self._device)
+        if H_target.shape[0] == 1 and batch_size != 1:
+            H_target = H_target.expand(batch_size, -1, -1)
+        elif H_target.shape[0] != batch_size:
+            raise ValueError(
+                f"H_target batch size ({H_target.shape[0]}) must be 1 or match batch_size ({batch_size})"
+            )
         if q0 is None:
-            q0 = torch.rand(batch_size, self._n_dofs, device=self._device)
+            q0 = torch.rand(batch_size, self._n_dofs, device=self._device, dtype=lower.dtype)
             q0 = lower + q0 * (upper - lower)
         else:
+            q0 = q0.to(device=self._device, dtype=lower.dtype).clone()
             # add some noise to get diverse solutions
-            q0 += torch.randn(batch_size, self._n_dofs, device=self._device) * q0_noise
+            q0 += torch.randn(batch_size, self._n_dofs, device=self._device, dtype=lower.dtype) * q0_noise
             q0 = torch.clamp(q0, lower, upper)
             assert q0.shape[0] == batch_size
             assert q0.shape[1] == self._n_dofs
 
         # Optimize
-        q = q0.clone().requires_grad_(True)
-        optimizer = torch.optim.Adam([q], lr=lr)
+        q = q0.clone()
+        damping = torch.full((batch_size,), 2.0e-1, device=self._device, dtype=q.dtype)
+        damping_min = torch.tensor(1.0e-5, device=self._device, dtype=q.dtype)
+        damping_max = torch.tensor(1.0e10, device=self._device, dtype=q.dtype)
+        lambda_factor = torch.tensor(2.0, device=self._device, dtype=q.dtype)
+        rho_min = torch.tensor(1.0e-3, device=self._device, dtype=q.dtype)
+        max_step_norm = 0.0
+        idx_valid = torch.empty((0,), dtype=torch.long, device=self._device)
         for i in range(max_iters):
-            optimizer.zero_grad()
             # Check if all configurations respect the termination criteria
             idx_valid = self.ik_termination(q, H_target, link_name, lower, upper, se3_eps=se3_eps, debug=debug)
             if idx_valid.nelement() == batch_size:
                 print(f"\nIK converged for all joint configurations in {i} iterations")
                 break
 
-            # TODO - optimize only the joint configurations that are not valid
+            active_mask = torch.ones(batch_size, dtype=torch.bool, device=self._device)
+            if idx_valid.nelement() > 0:
+                active_mask[idx_valid] = False
+            idx_active = torch.argwhere(active_mask).reshape(-1)
+            if idx_active.numel() == 0:
+                break
 
-            # loss and gradient step
-            err_per_q = self.loss_fn_ik_per_q(
-                q,
-                H_target,
-                link_name,
-                w_se3=1.0,
-                w_joint_limits=300.0,
-                lower=lower,
-                upper=upper,
-                w_q_rest=1.0,
-                q_rest=None,
-                debug=debug,
+            residual, jacobian_analytic = self.compute_ik_residual_and_analytic_jacobian(
+                q[idx_active], H_target[idx_active], link_name
             )
+            err_per_q = torch.linalg.norm(residual, dim=-1)
+
             if (i == 0 or (i % print_freq) == 0) and print_freq != -1:
                 print(f"\n---> Iter {i}/{max_iters}")
                 print(f"Error mean, std: {err_per_q.mean():.3f}, {err_per_q.std():.3f}")
                 print(f"idx_valid: {len(idx_valid)}/{batch_size}")
+                print(f"idx_active: {len(idx_active)}/{batch_size}")
 
-            # do not optimize configurations that are already valid
-            err_per_q.sum().backward()
-            optimizer.step()
+            with torch.no_grad():
+                jt = jacobian_analytic.transpose(-2, -1)
+                normal_matrix = jt @ jacobian_analytic
+                gradient = jt @ residual.unsqueeze(-1)
+                eye = torch.eye(self._n_dofs, device=self._device, dtype=q.dtype).unsqueeze(0)
+                lm_matrix = normal_matrix + damping[idx_active].view(-1, 1, 1) * eye
+                dq = torch.linalg.solve(lm_matrix, -gradient).squeeze(-1)
+                dq = lr * dq
 
-        if i == max_iters - 1:
+                if max_step_norm > 0.0:
+                    dq_norm = torch.linalg.norm(dq, dim=-1, keepdim=True)
+                    step_scale = torch.where(
+                        dq_norm > max_step_norm,
+                        max_step_norm / dq_norm.clamp_min(1.0e-8),
+                        torch.ones_like(dq_norm),
+                    )
+                    dq = dq * step_scale
+
+                q_candidate = torch.clamp(q[idx_active] + dq, lower, upper)
+                residual_candidate, _ = self.compute_ik_residual_and_analytic_jacobian(
+                    q_candidate, H_target[idx_active], link_name
+                )
+                candidate_cost = 0.5 * residual_candidate.pow(2).sum(-1)
+                current_cost = 0.5 * residual.pow(2).sum(-1)
+                actual_reduction = current_cost - candidate_cost
+                grad_flat = gradient.squeeze(-1)
+                h_dq = (normal_matrix @ dq.unsqueeze(-1)).squeeze(-1)
+                predicted_reduction = -(grad_flat * dq).sum(-1) - 0.5 * (dq * h_dq).sum(-1)
+                rho = actual_reduction / predicted_reduction.clamp_min(1.0e-12)
+                improved = torch.logical_and(actual_reduction > 0.0, rho > rho_min)
+
+                if improved.any():
+                    q[idx_active[improved]] = q_candidate[improved]
+                damping_active = damping[idx_active]
+                damping[idx_active[improved]] = torch.maximum(damping_active[improved] / lambda_factor, damping_min)
+                damping[idx_active[~improved]] = torch.minimum(damping_active[~improved] * lambda_factor, damping_max)
+
+        if i == max_iters - 1 and idx_valid.nelement() != batch_size:
+            residual, _ = self.compute_ik_residual_and_analytic_jacobian(q[idx_active], H_target[idx_active], link_name)
+            err_per_q = torch.linalg.norm(residual, dim=-1)
             print(f"\nIK did not converge for all joint configurations!")
             print(f"Error mean, std: {err_per_q.mean():.3f}, {err_per_q.std():.3f}")
             print(f"idx_valid: {len(idx_valid)}/{batch_size}")
 
-        return q, idx_valid
+        return q.detach(), idx_valid
 
     def loss_fn_ik_per_q(
         self,

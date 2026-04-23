@@ -12,5 +12,6 @@ from .env_planar4link import EnvPlanar4Link, EnvPlanar4LinkExtraObjectsV00
 from .env_spheres_3d import EnvSpheres3D, EnvSpheres3DExtraObjectsV00
 from .env_square_2d import EnvSquare2D
 from .env_table_shelf import EnvTableShelf, EnvTableShelfExtraObjectsV00
+from .env_mbm_table import EnvMBMTable
 from .env_warehouse import EnvWarehouse, EnvWarehouseExtraObjectsV00
 from .env_empty_2d import EnvEmpty2D, EnvEmpty2DExtraSphere, EnvEmpty2DExtraNonConvex, EnvEmpty2DExtraSquare

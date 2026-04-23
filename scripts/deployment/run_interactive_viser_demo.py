@@ -113,6 +113,20 @@ def _safe_metric_scalar(value):
     return None
 
 
+def _format_seconds(seconds):
+    if seconds is None:
+        return "-"
+    return f"{seconds:.3f} s"
+
+
+def _synchronize_torch_device(device):
+    device = torch.device(device)
+    if device.type == "cuda" and torch.cuda.is_available():
+        torch.cuda.synchronize(device)
+    elif device.type == "mps" and hasattr(torch, "mps") and hasattr(torch.mps, "synchronize"):
+        torch.mps.synchronize()
+
+
 def _get_reference_subset_and_length(planner, selection):
     subset = planner.val_subset if selection == "validation" else planner.train_subset
     return subset, len(subset)
@@ -331,6 +345,8 @@ def _visualize_ik_debug_in_viser(
     planner,
     max_collision_free_to_render=4,
     max_colliding_to_render=4,
+    max_ik_valid_to_render=4,
+    max_ik_refined_to_render=4,
     sphere_margin=0.0,
 ):
     _clear_ik_debug_viser(server)
@@ -361,6 +377,26 @@ def _visualize_ik_debug_in_viser(
 
     q_candidates_collision_free = ik_debug_data["q_candidates_collision_free"]
     q_candidates_colliding = ik_debug_data["q_candidates_colliding"]
+    q_candidates_ik_valid = ik_debug_data.get("q_candidates_ik_valid")
+    q_candidates_ik_refined = ik_debug_data.get("q_candidates_ik_refined")
+    idx_valid_refined_se3 = ik_debug_data.get("idx_valid_refined_se3")
+
+    q_candidates_refined_se3_valid = None
+    q_candidates_refined_se3_invalid = None
+    if q_candidates_ik_refined is not None and idx_valid_refined_se3 is not None:
+        idx_valid_refined_se3 = torch.atleast_1d(idx_valid_refined_se3).reshape(-1)
+        if q_candidates_ik_refined.shape[0] > 0:
+            refined_valid_mask = torch.zeros(
+                q_candidates_ik_refined.shape[0],
+                dtype=torch.bool,
+                device=q_candidates_ik_refined.device,
+            )
+            if idx_valid_refined_se3.numel() > 0:
+                refined_valid_mask[idx_valid_refined_se3] = True
+            q_candidates_refined_se3_valid = q_candidates_ik_refined[refined_valid_mask]
+            q_candidates_refined_se3_invalid = q_candidates_ik_refined[~refined_valid_mask]
+
+    rendered_any_candidates = False
 
     for idx, q in enumerate(q_candidates_colliding[:max_colliding_to_render]):
         group_name = f"/ik_debug/colliding_{idx}"
@@ -373,6 +409,7 @@ def _visualize_ik_debug_in_viser(
             opacity=0.18,
             sphere_margin=sphere_margin,
         )
+        rendered_any_candidates = True
 
     for idx, q in enumerate(q_candidates_collision_free[:max_collision_free_to_render]):
         group_name = f"/ik_debug/collision_free_{idx}"
@@ -385,6 +422,48 @@ def _visualize_ik_debug_in_viser(
             opacity=0.16,
             sphere_margin=sphere_margin,
         )
+        rendered_any_candidates = True
+
+    if not rendered_any_candidates and q_candidates_refined_se3_valid is not None:
+        for idx, q in enumerate(q_candidates_refined_se3_valid[:max_ik_refined_to_render]):
+            group_name = f"/ik_debug/refined_pose_valid_{idx}"
+            _add_robot_spheres_to_viser_group(
+                server,
+                robot,
+                q,
+                group_name=group_name,
+                color=(90, 150, 255),
+                opacity=0.14,
+                sphere_margin=sphere_margin,
+            )
+            rendered_any_candidates = True
+
+    if not rendered_any_candidates and q_candidates_refined_se3_invalid is not None:
+        for idx, q in enumerate(q_candidates_refined_se3_invalid[:max_ik_refined_to_render]):
+            group_name = f"/ik_debug/refined_pose_miss_{idx}"
+            _add_robot_spheres_to_viser_group(
+                server,
+                robot,
+                q,
+                group_name=group_name,
+                color=(160, 120, 255),
+                opacity=0.12,
+                sphere_margin=sphere_margin,
+            )
+            rendered_any_candidates = True
+
+    if not rendered_any_candidates and q_candidates_ik_valid is not None:
+        for idx, q in enumerate(q_candidates_ik_valid[:max_ik_valid_to_render]):
+            group_name = f"/ik_debug/ik_valid_{idx}"
+            _add_robot_spheres_to_viser_group(
+                server,
+                robot,
+                q,
+                group_name=group_name,
+                color=(170, 110, 255),
+                opacity=0.12,
+                sphere_margin=sphere_margin,
+            )
 
 
 def main():
@@ -465,6 +544,11 @@ def main():
             robot_viser_mode = "spheres"
 
     status = server.gui.add_text("Status", "Idle", disabled=True)
+    ik_time_text = server.gui.add_text("IK total time", "-", disabled=True)
+    ik_coarse_time_text = server.gui.add_text("IK coarse time", "-", disabled=True)
+    ik_refined_time_text = server.gui.add_text("IK refined time", "-", disabled=True)
+    planning_time_text = server.gui.add_text("Planning time", "-", disabled=True)
+    total_time_text = server.gui.add_text("IK + planning time", "-", disabled=True)
     dataset_goal_slider = server.gui.add_slider(
         f"{reference_split} ee_goal index",
         min=0,
@@ -515,6 +599,11 @@ def main():
         goal_gizmo.position = goal_position_new
         goal_gizmo.wxyz = goal_wxyz_new
         _clear_ik_debug_viser(server)
+        ik_time_text.value = "-"
+        ik_coarse_time_text.value = "-"
+        ik_refined_time_text.value = "-"
+        planning_time_text.value = "-"
+        total_time_text.value = "-"
         status.value = f"Loaded EE goal from {reference_split}[{int(dataset_goal_slider.value)}]"
 
     persistent_executor = PersistentSapienTrajectoryExecutor(
@@ -534,7 +623,14 @@ def main():
             plan_button.disabled = True
 
         status.value = "Planning..."
+        ik_time_text.value = "-"
+        ik_coarse_time_text.value = "-"
+        ik_refined_time_text.value = "-"
+        planning_time_text.value = "-"
+        total_time_text.value = "-"
 
+        ik_time = None
+        planning_time = None
         try:
             current_extra_boxes = [box for widget in runtime_widgets if (box := widget.current_box_spec()) is not None]
             _clear_ik_debug_viser(server)
@@ -554,15 +650,77 @@ def main():
 
             planner.update_extra_boxes(current_extra_boxes)
 
-            results_single_plan = planner.plan_to_ee_goal(
+            _synchronize_torch_device(tensor_args["device"])
+            ik_t0 = time.perf_counter()
+            q_goal_candidates = planner.solve_goal_ik(
                 q_start=demo_state["q_start"],
                 ee_pose_goal=current_goal,
-                n_ik_candidates=cfg.get("n_ik_candidates", 64),
-                max_goal_candidates=cfg.get("max_goal_candidates", 4),
-                ik_max_iterations=cfg.get("ik_max_iterations", 500),
-                ik_lr=cfg.get("ik_lr", 2e-1),
-                ik_se3_eps=cfg.get("ik_se3_eps", 5e-2),
+                batch_size=cfg.get("n_ik_candidates", 64),
+                max_iterations=cfg.get("ik_max_iterations", 500),
+                lr=cfg.get("ik_lr", 2e-1),
+                se3_eps=cfg.get("ik_se3_eps", 5e-2),
+                max_candidates=cfg.get("max_goal_candidates", 4),
                 debug=cfg.get("debug", False),
+            )
+            _synchronize_torch_device(tensor_args["device"])
+            ik_time = time.perf_counter() - ik_t0
+            ik_debug_data = planner.last_ik_debug_data or {}
+            ik_time_total = float(ik_debug_data.get("t_ik_total_wall", ik_time))
+            ik_time_coarse = float(ik_debug_data.get("t_ik_coarse_wall", ik_time_total))
+            ik_time_refined = float(ik_debug_data.get("t_ik_refined_wall", max(ik_time_total - ik_time_coarse, 0.0)))
+            ik_time_text.value = _format_seconds(ik_time_total)
+            ik_coarse_time_text.value = _format_seconds(ik_time_coarse)
+            ik_refined_time_text.value = _format_seconds(ik_time_refined)
+            status.value = (
+                f"IK finished in {_format_seconds(ik_time_total)} "
+                f"(coarse {_format_seconds(ik_time_coarse)}, refined {_format_seconds(ik_time_refined)}). "
+                f"Planning trajectory..."
+            )
+
+            if q_goal_candidates.numel() == 0:
+                _visualize_ik_debug_in_viser(
+                    server,
+                    planner,
+                    max_collision_free_to_render=cfg.get("max_collision_free_to_render", 4),
+                    max_colliding_to_render=cfg.get("max_colliding_to_render", 4),
+                    max_ik_valid_to_render=cfg.get("max_ik_valid_to_render", 4),
+                    max_ik_refined_to_render=cfg.get("max_ik_refined_to_render", 4),
+                    sphere_margin=float(cfg.get("robot_q_init_sphere_margin", 0.0)),
+                )
+                raise RuntimeError("No collision-free IK candidate was found for the requested EE goal pose")
+
+            ik_debug_data = planner.last_ik_debug_data
+            _synchronize_torch_device(tensor_args["device"])
+            planning_t0 = time.perf_counter()
+            try:
+                results_single_plan = planner.plan_to_ee_goal(
+                    q_start=demo_state["q_start"],
+                    ee_pose_goal=current_goal,
+                    q_goal_candidates=q_goal_candidates,
+                    n_trajectory_samples=100,
+                    n_ik_candidates=cfg.get("n_ik_candidates", 64),
+                    max_goal_candidates=cfg.get("max_goal_candidates", 4),
+                    ik_max_iterations=cfg.get("ik_max_iterations", 500),
+                    ik_lr=cfg.get("ik_lr", 2e-1),
+                    ik_se3_eps=cfg.get("ik_se3_eps", 5e-2),
+                    debug=cfg.get("debug", False),
+                )
+            finally:
+                planner.last_ik_debug_data = ik_debug_data
+                _synchronize_torch_device(tensor_args["device"])
+                planning_time = time.perf_counter() - planning_t0
+                planning_time_text.value = _format_seconds(planning_time)
+                total_time_text.value = _format_seconds(ik_time_total + planning_time)
+            results_single_plan.t_ik_wall = ik_time_total
+            results_single_plan.t_ik_coarse_wall = ik_time_coarse
+            results_single_plan.t_ik_refined_wall = ik_time_refined
+            results_single_plan.t_planning_wall = planning_time
+            results_single_plan.t_ik_and_planning_wall = ik_time_total + planning_time
+            print(
+                f"IK time: {_format_seconds(ik_time_total)} "
+                f"(coarse {_format_seconds(ik_time_coarse)}, refined {_format_seconds(ik_time_refined)}) | "
+                f"Planning time: {_format_seconds(planning_time)} | "
+                f"IK + planning: {_format_seconds(ik_time_total + planning_time)}"
             )
 
             torch.save(
@@ -572,16 +730,24 @@ def main():
             )
 
             if results_single_plan.q_trajs_pos_best is None:
-                status.value = "Planning finished, but no valid trajectory was found."
+                status.value = (
+                    "Planning finished, but no valid trajectory was found. "
+                    f"IK: {_format_seconds(ik_time_total)} "
+                    f"(coarse {_format_seconds(ik_time_coarse)}, refined {_format_seconds(ik_time_refined)}), "
+                    f"planning: {_format_seconds(planning_time)}"
+                )
                 return
 
             path_length = _safe_metric_scalar(results_single_plan.metrics.get("trajs_best", {}).get("path_length"))
             status.value = (
-                f"Plan found. Inference: {results_single_plan.t_inference_total:.2f}s"
+                f"Plan found. IK: {_format_seconds(ik_time_total)} "
+                f"(coarse {_format_seconds(ik_time_coarse)}, refined {_format_seconds(ik_time_refined)}), "
+                f"planning: {_format_seconds(planning_time)}"
+                f", inference: {results_single_plan.t_inference_total:.2f}s"
                 + (f", path length: {path_length:.3f}" if path_length is not None else "")
             )
 
-            demo_state["q_start"] = results_single_plan.q_pos_goal.detach().clone()
+            demo_state["q_start"] = results_single_plan.q_trajs_pos_best[-1].detach().clone()
             q_start_text.value = np.array2string(
                 demo_state["q_start"].detach().cpu().numpy(), precision=3, separator=", "
             )
@@ -620,16 +786,36 @@ def main():
                 )
                 status.value = (
                     f"Execution finished. Final tracking error: "
-                    f"{float(sapien_stats['final_tracking_error_l2']):.4f}"
+                    f"{float(sapien_stats['final_tracking_error_l2']):.4f}. "
+                    f"IK: {_format_seconds(ik_time_total)} "
+                    f"(coarse {_format_seconds(ik_time_coarse)}, refined {_format_seconds(ik_time_refined)}), "
+                    f"planning: {_format_seconds(planning_time)}"
                 )
         except Exception as exc:
-            status.value = f"Error: {exc}"
+            timing_parts = []
+            if ik_time is not None:
+                ik_debug_data = planner.last_ik_debug_data or {}
+                ik_time_total = float(ik_debug_data.get("t_ik_total_wall", ik_time))
+                ik_time_coarse = float(ik_debug_data.get("t_ik_coarse_wall", ik_time_total))
+                ik_time_refined = float(ik_debug_data.get("t_ik_refined_wall", max(ik_time_total - ik_time_coarse, 0.0)))
+                ik_time_text.value = _format_seconds(ik_time_total)
+                ik_coarse_time_text.value = _format_seconds(ik_time_coarse)
+                ik_refined_time_text.value = _format_seconds(ik_time_refined)
+                timing_parts.append(
+                    f"IK: {_format_seconds(ik_time_total)} "
+                    f"(coarse {_format_seconds(ik_time_coarse)}, refined {_format_seconds(ik_time_refined)})"
+                )
+            if planning_time is not None:
+                timing_parts.append(f"planning: {_format_seconds(planning_time)}")
+            status.value = f"Error: {exc}" + (f" ({', '.join(timing_parts)})" if timing_parts else "")
             if planner.last_ik_debug_data is not None:
                 _visualize_ik_debug_in_viser(
                     server,
                     planner,
                     max_collision_free_to_render=cfg.get("max_collision_free_to_render", 4),
                     max_colliding_to_render=cfg.get("max_colliding_to_render", 4),
+                    max_ik_valid_to_render=cfg.get("max_ik_valid_to_render", 4),
+                    max_ik_refined_to_render=cfg.get("max_ik_refined_to_render", 4),
                     sphere_margin=float(cfg.get("robot_q_init_sphere_margin", 0.0)),
                 )
             if cfg.get("save_ik_debug_plot_on_failure", True) and planner.last_ik_debug_data is not None:

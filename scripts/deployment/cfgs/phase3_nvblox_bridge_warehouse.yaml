@@ -34,7 +34,7 @@ ignore_scene_box_margin: 0.10
 ignore_boxes: []
 ignore_box_margin: 0.0
 subtract_robot: true
-robot_sphere_margin: 0.2
+robot_sphere_margin: 0.1
 inflate_robot_mask_by_voxel_extent: false
 
 # Optional MapperParams overrides. Example structure:

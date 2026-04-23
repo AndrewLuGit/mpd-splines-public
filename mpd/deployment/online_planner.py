@@ -277,6 +277,7 @@ class OnlineMPDPlanner:
         q_start,
         ee_pose_goal,
         q_goal_candidates=None,
+        n_trajectory_samples=None,
         n_ik_candidates=32,
         max_goal_candidates=4,
         ik_max_iterations=500,
@@ -309,7 +310,12 @@ class OnlineMPDPlanner:
 
         q_start_collision_debug = compute_q_collision_breakdown(self, q_start)
         self.last_q_collision_debug = q_start_collision_debug
-        if q_start_collision_debug["combined_check"]["colliding"]:
+        q_start_colliding_hard = bool(self.planning_task.compute_collision(q_start, margin=0.0).reshape(-1)[0].item())
+        q_start_collision_debug["combined_check_hard_margin0"] = {
+            "colliding": q_start_colliding_hard,
+            "cost": float(torch.as_tensor(self.planning_task.compute_collision_cost(q_start, margin=0.0)).reshape(-1).max().item()),
+        }
+        if q_start_colliding_hard:
             raise RuntimeError(
                 "q_start is in collision with the current environment. "
                 f"{format_q_collision_breakdown(q_start_collision_debug)}"
@@ -323,6 +329,7 @@ class OnlineMPDPlanner:
                 q_start,
                 q_goal,
                 ee_pose_goal,
+                n_trajectory_samples=n_trajectory_samples,
                 results_ns=results_ns,
                 debug=debug,
             )
