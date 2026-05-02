@@ -344,6 +344,9 @@ class GaussianDiffusionModel(nn.Module, ABC):
             else:
                 x, x_recon = update_x(x, grad_prior)
 
+            x = x.detach()
+            x_recon = x_recon.detach()
+
             if _time_next >= 1:
                 # add noise
                 noise = torch.randn_like(x) if ddim_eta != 0.0 else 0.0
@@ -405,33 +408,39 @@ class GaussianDiffusionModel(nn.Module, ABC):
             context_d[k] = einops.repeat(v, "... -> b ...", b=n_samples)
 
         # Sample from diffusion model
-        samples, chain, chain_x_recon = self.conditional_sample(
+        sample_outputs = self.conditional_sample(
             hard_conds,
             context_d=context_d,
             batch_size=n_samples,
-            return_chain=True,
-            return_chain_x_recon=True,
+            return_chain=return_chain,
+            return_chain_x_recon=return_chain_x_recon,
             **diffusion_kwargs,
         )
+        samples = sample_outputs[0]
+        output_idx = 1
 
-        # chain: [ n_samples x (n_diffusion_steps + 1) x horizon x (state_dim)]
-        # extract normalized trajectories
-        trajs_chain_normalized = chain
-        trajs_x_recon_chain_normalized = chain_x_recon
+        trajs_chain_normalized = None
+        if return_chain:
+            # chain: [n_samples x (n_diffusion_steps + 1) x horizon x state_dim]
+            chain = sample_outputs[output_idx]
+            output_idx += 1
+            # trajs: [(n_diffusion_steps + 1) x n_samples x horizon x state_dim]
+            trajs_chain_normalized = einops.rearrange(chain, "b diffsteps ... -> diffsteps b ...")
 
-        # trajs: [ (n_diffusion_steps + 1) x n_samples x horizon x state_dim ]
-        trajs_chain_normalized = einops.rearrange(trajs_chain_normalized, "b diffsteps ... -> diffsteps b ...")
-        trajs_x_recon_chain_normalized = einops.rearrange(
-            trajs_x_recon_chain_normalized, "b diffsteps ... -> diffsteps b ..."
-        )
+        trajs_x_recon_chain_normalized = None
+        if return_chain_x_recon:
+            chain_x_recon = sample_outputs[output_idx]
+            trajs_x_recon_chain_normalized = einops.rearrange(chain_x_recon, "b diffsteps ... -> diffsteps b ...")
 
         if return_chain and return_chain_x_recon:
             return trajs_chain_normalized, trajs_x_recon_chain_normalized
         elif return_chain:
             return trajs_chain_normalized
+        elif return_chain_x_recon:
+            return trajs_x_recon_chain_normalized
 
         # return the last denoising step
-        return trajs_chain_normalized[-1]
+        return samples
 
     # ------------------------------------------ training ------------------------------------------#
 

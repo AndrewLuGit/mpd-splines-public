@@ -11,6 +11,7 @@ from pprint import pprint
 os.environ.setdefault("MPLCONFIGDIR", "/tmp/mplconfig")
 
 import torch
+import numpy as np
 import yaml
 
 from mpd.deployment.goal_ik import build_ee_pose_goal_from_dict
@@ -37,6 +38,8 @@ from mpd.deployment.sapien_depth_adapter import (
 )
 from mpd.deployment.scene_voxelizer import save_occupancy_projections
 from mpd.deployment.sapien_trajectory_executor import (
+    build_scene_spec_from_planning_env,
+    save_trajectory_composite_image_in_sapien,
     visualize_box_collision_debug_in_sapien,
     visualize_esdf_debug_in_sapien,
     visualize_phase3_scene_debug_in_sapien,
@@ -74,6 +77,24 @@ def _deep_update(base, updates):
 def _save_box_specs(path, box_specs):
     with open(path, "w") as stream:
         yaml.dump({"extra_boxes": list(box_specs or [])}, stream, Dumper=yaml.Dumper, allow_unicode=True)
+
+
+def _select_trajectory_composite_camera_cfg(cfg_pipeline, cfg_phase2):
+    camera_cfg = cfg_pipeline.get("trajectory_composite_camera")
+    if camera_cfg is not None:
+        return deepcopy(camera_cfg)
+
+    camera_specs = cfg_pipeline.get("trajectory_composite_camera_specs") or cfg_phase2.get("camera_specs") or []
+    if not camera_specs:
+        raise ValueError(
+            "save_trajectory_composite is enabled, but no trajectory_composite_camera or phase2 camera_specs were provided"
+        )
+
+    camera_cfg = deepcopy(camera_specs[0])
+    camera_cfg["name"] = cfg_pipeline.get(
+        "trajectory_composite_camera_name", camera_cfg.get("name", "trajectory_composite")
+    )
+    return camera_cfg
 
 
 def _prepare_start_and_goal(cfg_pipeline, cfg_phase1, tensor_args, results_dir):
@@ -324,6 +345,48 @@ def _run_planning_phase(cfg_phase1, q_start, ee_pose_goal, filtered_boxes, resul
         raise
 
 
+def _save_trajectory_composite(cfg_pipeline, cfg_phase1, cfg_phase2, planner, results_single_plan, phase1_results_dir):
+    if results_single_plan.q_trajs_pos_best is None:
+        return None
+
+    composite_filename = cfg_pipeline.get("trajectory_composite_filename", "trajectory_composite.png")
+    composite_path = (
+        _resolve_repo_path(composite_filename)
+        if os.path.isabs(composite_filename)
+        else os.path.join(
+            phase1_results_dir,
+            composite_filename,
+        )
+    )
+    camera_cfg = _select_trajectory_composite_camera_cfg(cfg_pipeline, cfg_phase2)
+    stats = save_trajectory_composite_image_in_sapien(
+        q_traj=results_single_plan.q_trajs_pos_best,
+        timesteps=results_single_plan.timesteps,
+        scene_spec=build_scene_spec_from_planning_env(planner.planning_task.env),
+        camera_spec=camera_cfg,
+        save_path=composite_path,
+        robot_cfg=cfg_phase1.get("sapien_robot"),
+        num_samples=cfg_pipeline.get("trajectory_composite_num_points", 32),
+        add_ground=cfg_pipeline.get("trajectory_composite_add_ground", cfg_phase1.get("sapien_add_ground", False)),
+        alpha=cfg_pipeline.get("trajectory_composite_alpha", 0.35),
+        alpha_ramp=cfg_pipeline.get("trajectory_composite_alpha_ramp", True),
+        robot_mask_threshold=cfg_pipeline.get("trajectory_composite_robot_mask_threshold", 0.03),
+    )
+
+    stats_filename = cfg_pipeline.get("trajectory_composite_stats_filename", "trajectory_composite_summary.yaml")
+    stats_path = (
+        _resolve_repo_path(stats_filename)
+        if os.path.isabs(stats_filename)
+        else os.path.join(
+            phase1_results_dir,
+            stats_filename,
+        )
+    )
+    stats["summary_path"] = stats_path
+    save_to_yaml(stats, stats_path)
+    return stats
+
+
 def _sample_esdf_debug_points(extra_distance_field, workspace_limits, cfg_pipeline, tensor_args):
     sample_spacing = float(cfg_pipeline.get("esdf_viewer_voxel_size", 0.10))
     workspace_padding = float(cfg_pipeline.get("esdf_viewer_workspace_padding", 0.0))
@@ -548,6 +611,17 @@ def main():
             "filtered_boxes": filtered_boxes,
             "removed_boxes": removed_boxes,
         }
+        trajectory_composite_stats = None
+        if cfg_pipeline.get("save_trajectory_composite", False):
+            trajectory_composite_stats = _save_trajectory_composite(
+                cfg_pipeline=cfg_pipeline,
+                cfg_phase1=cfg_phase1,
+                cfg_phase2=cfg_phase2,
+                planner=planner,
+                results_single_plan=results_single_plan,
+                phase1_results_dir=phase1_results_dir,
+            )
+            planning_results["trajectory_composite_stats"] = trajectory_composite_stats
 
         print("\n----------------COMBINED PIPELINE----------------")
         print(f"cfg: {cfg_path}")
@@ -595,6 +669,9 @@ def main():
         if sapien_statistics is not None:
             print("\n----------------SAPIEN----------------")
             pprint(sapien_statistics)
+        if trajectory_composite_stats is not None:
+            print("\n----------------TRAJECTORY COMPOSITE----------------")
+            pprint(trajectory_composite_stats)
     finally:
         bootstrap_planner.cleanup()
         if planning_results is not None and planning_results.get("planner") is not None:

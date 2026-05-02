@@ -43,6 +43,12 @@ class EvaluationSamplesGenerator:
         debug=False,
         render_pybullet=False,
         min_distance_q_pos_start_goal=None,
+        solve_goal_ik_if_dataset_goal_in_collision=True,
+        goal_ik_batch_size=128,
+        goal_ik_max_iterations=500,
+        goal_ik_lr=2e-1,
+        goal_ik_se3_eps=5e-2,
+        goal_ik_max_candidates=8,
         **kwargs,
     ):
         self.tensor_args = tensor_args
@@ -65,6 +71,16 @@ class EvaluationSamplesGenerator:
         self.min_distance_q_pos_start_goal = None
         if min_distance_q_pos_start_goal is not None:
             self.min_distance_q_pos_start_goal = min_distance_q_pos_start_goal
+        self.solve_goal_ik_if_dataset_goal_in_collision = solve_goal_ik_if_dataset_goal_in_collision
+        self.goal_ik_kwargs = dict(
+            batch_size=goal_ik_batch_size,
+            max_iterations=goal_ik_max_iterations,
+            lr=goal_ik_lr,
+            se3_eps=goal_ik_se3_eps,
+            max_candidates=goal_ik_max_candidates,
+            debug=debug,
+        )
+        self.planning_task = planning_task
 
         # OMPL worker to generate random start and goal joint positions
         self.generate_data_ompl_worker = GenerateDataOMPL(
@@ -82,12 +98,33 @@ class EvaluationSamplesGenerator:
 
         self.ee_markers_ids = []
 
+    def _solve_collision_free_goal_ik(self, q_pos_start, ee_pose_goal):
+        if not self.solve_goal_ik_if_dataset_goal_in_collision:
+            return None
+        if ee_pose_goal is None:
+            return None
+        if getattr(self.planning_task.robot, "diff_panda", None) is None:
+            return None
+
+        from mpd.deployment.goal_ik import solve_panda_goal_ik
+
+        q_goal_candidates = solve_panda_goal_ik(
+            self.planning_task,
+            q_start=to_torch(q_pos_start, **self.tensor_args),
+            ee_pose_goal=to_torch(ee_pose_goal, **self.tensor_args),
+            **self.goal_ik_kwargs,
+        )
+        if q_goal_candidates is None or q_goal_candidates.numel() == 0:
+            return None
+        return q_goal_candidates[0]
+
     def get_data_sample(self, idx, **kwargs):
         # -----------------------------------------------
         # Get the start and goal states
         # If extra objects are used, since they are not part of the original environment,
         # the start goal states from the training or validation sets might be in collision.
-        # We just reject those samples and get new ones.
+        # For colliding goals, we first try to recover a new collision-free q_goal by solving IK for the dataset
+        # end-effector goal pose. If that fails, we reject the sample and get a new one.
         if self.select_start_goal_from_file:
             idx = idx % len(self.select_start_goal_from_file)
             q_pos_start = to_torch(self.select_start_goal_from_file[idx]["q_pos_start"], **self.tensor_args)
@@ -106,8 +143,12 @@ class EvaluationSamplesGenerator:
             return self.get_data_sample(idx + 1)
 
         if not self.generate_data_ompl_worker.pbompl_interface.is_state_valid(to_numpy(q_pos_goal)):
-            print("Goal state is in collision. Getting new sample...")
-            return self.get_data_sample(idx + 1)
+            q_pos_goal_ik = self._solve_collision_free_goal_ik(q_pos_start, ee_pose_goal)
+            if q_pos_goal_ik is None:
+                print("Goal state is in collision and IK fallback failed. Getting new sample...")
+                return self.get_data_sample(idx + 1)
+            print("Goal state is in collision. Using collision-free IK fallback goal.")
+            q_pos_goal = q_pos_goal_ik
 
         q_pos_start = to_torch(q_pos_start, **self.tensor_args)
         q_pos_goal = to_torch(q_pos_goal, **self.tensor_args)
@@ -564,6 +605,7 @@ class GenerativeOptimizationPlanner:
 
                 results_ns.t_guide += t_guide_extra_mp_steps.elapsed
 
+        control_points_normalized_iters = control_points_normalized_iters.detach()
         results_ns.t_inference_total = t_inference_total.elapsed
 
         # unnormalize control point samples from the models and get the trajectory from the control points

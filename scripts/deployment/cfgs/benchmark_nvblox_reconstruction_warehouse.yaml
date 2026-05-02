@@ -1,0 +1,79 @@
+results_dir: logs/nvblox_reconstruction_benchmark
+
+iterations: 100
+device: cuda
+seed: 2
+
+rotation_z_axis_deg: 0.0
+
+extra_boxes:
+  - name: runtime_box_0
+    center: [0.85, 0.10, 0.125]
+    size: [0.10, 0.25, 0.25]
+  - name: runtime_box_1
+    center: [0.60, -0.15, 0.25]
+    size: [0.25, 0.25, 0.50]
+
+randomization:
+  center_bounds:
+    x: [0.35, 1.05]
+    y: [-0.35, 0.35]
+  keep_box_inside_bounds: true
+
+camera_specs:
+  - name: overhead_main
+    width: 640
+    height: 480
+    fov_y_deg: 55.0
+    position: [1.15, -0.85, 1.45]
+    target: [0.55, 0.05, 0.40]
+    near: 0.1
+    far: 4.0
+  - name: side_main
+    width: 640
+    height: 480
+    fov_y_deg: 55.0
+    position: [1.25, 0.55, 1.10]
+    target: [0.50, 0.05, 0.45]
+    near: 0.1
+    far: 4.0
+
+add_ground: false
+capture_backend: stereo_depth_sensor
+mask_robot_from_depth: true
+robot_depth_mask_epsilon_m: 0.1
+robot_depth_mask_dilation_px: 5
+stereo_sensor_config: {}
+
+robot:
+  enabled: true
+  gripper: true
+  qpos: [0.0, -0.785398, 0.0, -2.356194, 0.0, 1.570796, 0.785398]
+
+integrator_type: tsdf
+extraction_method: tsdf_sparse
+pose_convention: sapien
+voxel_size: 0.05
+workspace_padding: 0.0
+query_chunk_size: 250000
+
+occupancy_threshold_log_odds: 0.0
+tsdf_weight_threshold: 0.0001
+tsdf_distance_threshold: 0.0
+
+min_component_voxels: 4
+max_boxes:
+merge_strategy: greedy_cuboids
+
+ignore_scene_box_sources:
+  - fixed
+ignore_scene_box_margin: 0.10
+ignore_boxes: []
+ignore_box_margin: 0.0
+subtract_robot: true
+robot_sphere_margin: 0.1
+inflate_robot_mask_by_voxel_extent: false
+
+mapper_params:
+  projective_integrator_params:
+    projective_integrator_max_integration_distance_m: 4.0

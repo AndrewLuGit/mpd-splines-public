@@ -133,10 +133,13 @@ class CostGuideManagerParametricTrajectory:
         # Unnormalize the control points.
         # The generative model outputs normalized control points, but the costs are defined on the unnormalized
         # trajectory space.
-        control_points = self.dataset.unnormalize_control_points(control_points_normalized)
+        # The guide computes gradients manually via task/joint Jacobians and
+        # dcp/dcp_normalized. Keeping autograd history here makes torchkin save
+        # every FK pose tensor during repeated guided planning calls.
+        control_points_normalized = control_points_normalized.detach()
+        control_points = self.dataset.unnormalize_control_points(control_points_normalized).detach()
 
         # Get the trajectory (position, velocity, acceleration) from the control points, in phase.
-        control_points.requires_grad_(True)
         q_traj_in_phase_d = self.parametric_trajectory.get_q_trajectory(
             control_points, None, None, get_type=("pos", "vel", "acc"), get_time_representation=False
         )
@@ -513,11 +516,11 @@ class CostJointSpacePathLength(CostJointSpace):
     def compute_cost_grad_wrt_cp(
         self, control_points, q_traj_pos_in_phase, q_traj_vel_in_phase, q_traj_acc_in_phase, *args, **kwargs
     ):
-        q_traj_pos_in_phase.requires_grad_(True)
+        q_traj_pos_in_phase = q_traj_pos_in_phase.detach().requires_grad_(True)
         q_traj_pos_diff = torch.zeros_like(q_traj_pos_in_phase)
         q_traj_pos_diff[..., 1:, :] = torch.diff(q_traj_pos_in_phase, dim=-2)
         cost_pos = 0.5 * torch.linalg.norm(q_traj_pos_diff, dim=-1)
-        grad_cost_wrt_q_pos = torch.autograd.grad(cost_pos.sum(), [q_traj_pos_in_phase], retain_graph=True)[0]
+        grad_cost_wrt_q_pos = torch.autograd.grad(cost_pos.sum(), [q_traj_pos_in_phase])[0]
 
         grad_cost_pos_wrt_cp = self.compute_grad_cost_wrt_cp(
             control_points,
@@ -536,9 +539,9 @@ class CostJointSpaceVelocity(CostJointSpace):
     def compute_cost_grad_wrt_cp(
         self, control_points, q_traj_pos_in_phase, q_traj_vel_in_phase, q_traj_acc_in_phase, *args, **kwargs
     ):
-        q_traj_vel_in_phase.requires_grad_(True)
+        q_traj_vel_in_phase = q_traj_vel_in_phase.detach().requires_grad_(True)
         cost_vel = 0.5 * torch.linalg.norm(q_traj_vel_in_phase, dim=-1)
-        grad_cost_wrt_q_vel = torch.autograd.grad(cost_vel.sum(), [q_traj_vel_in_phase], retain_graph=True)[0]
+        grad_cost_wrt_q_vel = torch.autograd.grad(cost_vel.sum(), [q_traj_vel_in_phase])[0]
 
         grad_cost_vel_wrt_cp = self.compute_grad_cost_wrt_cp(
             control_points,
@@ -557,9 +560,9 @@ class CostJointSpaceAcceleration(CostJointSpace):
     def compute_cost_grad_wrt_cp(
         self, control_points, q_traj_pos_in_phase, q_traj_vel_in_phase, q_traj_acc_in_phase, *args, **kwargs
     ):
-        q_traj_acc_in_phase.requires_grad_(True)
+        q_traj_acc_in_phase = q_traj_acc_in_phase.detach().requires_grad_(True)
         cost_acc = 0.5 * torch.linalg.norm(q_traj_acc_in_phase, dim=-1)
-        grad_cost_wrt_q_acc = torch.autograd.grad(cost_acc.sum(), [q_traj_acc_in_phase], retain_graph=True)[0]
+        grad_cost_wrt_q_acc = torch.autograd.grad(cost_acc.sum(), [q_traj_acc_in_phase])[0]
 
         grad_cost_acc_wrt_cp = self.compute_grad_cost_wrt_cp(
             control_points,
@@ -689,7 +692,7 @@ class CostTaskSpaceCollisionSelf(CostTaskSpace):
 
         # C, dC/dx
         with torch.enable_grad():
-            x_positions.requires_grad_(True)
+            x_positions = x_positions.detach().requires_grad_(True)
             cost, _ = self.collision_self_field.compute_distance_field_cost_and_gradient(x_positions)
             # TODO - implement gradient inside the collision self field
             grad_cost_wrt_x = torch.autograd.grad(cost.sum(), [x_positions])[0]

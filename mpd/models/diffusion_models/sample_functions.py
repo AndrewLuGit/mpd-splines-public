@@ -162,7 +162,7 @@ def guide_gradient_steps(
     if return_chain_x:
         return chain
 
-    return x_opt
+    return x_opt.detach()
 
 
 def ddim_create_time_pairs(

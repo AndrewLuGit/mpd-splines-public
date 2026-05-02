@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from dataclasses import asdict
 import gc
+import json
+import os
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -9,8 +11,10 @@ import numpy as np
 from mpd.deployment.sapien_depth_adapter import (
     _build_box_actor,
     _create_scene,
+    _create_render_cameras,
     _load_robot_articulation,
     _matrix_to_sapien_pose,
+    DepthCameraSpec,
     environment_to_scene_boxes,
     make_camera_pose_look_at,
 )
@@ -43,6 +47,40 @@ def _as_numpy_timesteps(timesteps, num_points, trajectory_duration):
     if timesteps.shape[0] != num_points:
         raise ValueError(f"Expected {num_points} trajectory timesteps, got {timesteps.shape[0]}")
     return timesteps
+
+
+def _capture_camera_rgb(scene, camera):
+    scene.update_render()
+    camera.take_picture()
+    color = np.asarray(camera.get_picture("Color"), dtype=np.float32)
+    if color.ndim != 3 or color.shape[2] < 3:
+        raise RuntimeError(f"Expected SAPIEN Color picture with shape (H, W, C>=3), got {color.shape}")
+    return np.clip(color[..., :3], 0.0, 1.0)
+
+
+def _sample_trajectory_evenly(q_traj_np, timesteps_np, num_samples):
+    num_samples = max(int(num_samples), 1)
+    if q_traj_np.shape[0] == 1 or num_samples == 1:
+        return q_traj_np[[0]], np.asarray([timesteps_np[0]], dtype=np.float32)
+
+    if np.any(np.diff(timesteps_np) <= 0.0):
+        sampled_indices = np.linspace(0, q_traj_np.shape[0] - 1, num_samples)
+        sample_times = np.linspace(float(timesteps_np[0]), float(timesteps_np[-1]), num_samples, dtype=np.float32)
+        sampled_q = np.stack(
+            [
+                np.interp(sampled_indices, np.arange(q_traj_np.shape[0], dtype=np.float32), q_traj_np[:, dof_idx])
+                for dof_idx in range(q_traj_np.shape[1])
+            ],
+            axis=-1,
+        )
+        return sampled_q.astype(np.float32), sample_times
+
+    sample_times = np.linspace(float(timesteps_np[0]), float(timesteps_np[-1]), num_samples, dtype=np.float32)
+    sampled_q = np.stack(
+        [np.interp(sample_times, timesteps_np, q_traj_np[:, dof_idx]) for dof_idx in range(q_traj_np.shape[1])],
+        axis=-1,
+    )
+    return sampled_q.astype(np.float32), sample_times
 
 
 def _expand_joint_parameter(value, dof, name):
@@ -119,6 +157,113 @@ def _with_box_pose_world(box_spec):
     return enriched
 
 
+def save_trajectory_composite_image_in_sapien(
+    q_traj,
+    timesteps,
+    scene_spec,
+    camera_spec,
+    save_path,
+    robot_cfg=None,
+    num_samples=32,
+    add_ground=False,
+    alpha=0.35,
+    alpha_ramp=True,
+    robot_mask_threshold=0.03,
+):
+    q_traj_np = _as_numpy_trajectory(q_traj)
+    timesteps_np = _as_numpy_timesteps(
+        timesteps=timesteps,
+        num_points=q_traj_np.shape[0],
+        trajectory_duration=max(float(q_traj_np.shape[0] - 1), 1.0),
+    )
+    sampled_q, sample_times = _sample_trajectory_evenly(q_traj_np, timesteps_np, num_samples)
+
+    if isinstance(camera_spec, dict):
+        camera_spec = DepthCameraSpec(**camera_spec)
+    if not isinstance(camera_spec, DepthCameraSpec):
+        raise TypeError(f"camera_spec must be a DepthCameraSpec or dict, got {type(camera_spec).__name__}")
+
+    os.makedirs(os.path.dirname(os.path.abspath(save_path)), exist_ok=True)
+
+    background_sapien = None
+    background_scene = None
+    sapien = None
+    scene = None
+    background_cameras = None
+    cameras = None
+    robot = None
+    try:
+        background_sapien, background_scene, _ = _create_scene(scene_spec=scene_spec, add_ground=add_ground)
+        sapien, scene, _ = _create_scene(scene_spec=scene_spec, add_ground=add_ground)
+        background_cameras = _create_render_cameras(background_scene, background_sapien, [camera_spec])
+        cameras = _create_render_cameras(scene, sapien, [camera_spec])
+
+        robot_cfg = dict(robot_cfg or {})
+        robot_cfg["enabled"] = True
+        robot_cfg["fix_root_link"] = bool(robot_cfg.get("fix_root_link", True))
+        robot_cfg["qpos"] = sampled_q[0].tolist()
+        robot = _load_robot_articulation(scene, sapien, robot_cfg)
+        if robot is None:
+            raise RuntimeError("Failed to create the SAPIEN robot articulation for trajectory composite rendering")
+        if sampled_q.shape[1] != robot.dof:
+            raise ValueError(
+                f"Trajectory dof mismatch: planner produced {sampled_q.shape[1]} joints but SAPIEN robot has {robot.dof}"
+            )
+
+        background_rgb = _capture_camera_rgb(background_scene, background_cameras[0])
+        composite = background_rgb.copy()
+        mask_fractions = []
+        alpha = float(alpha)
+
+        for sample_idx, q_sample in enumerate(sampled_q):
+            robot.set_qpos(q_sample)
+            if hasattr(robot, "set_qvel"):
+                robot.set_qvel(np.zeros((robot.dof,), dtype=np.float32))
+            robot_rgb = _capture_camera_rgb(scene, cameras[0])
+            robot_mask = np.linalg.norm(robot_rgb - background_rgb, axis=-1) > float(robot_mask_threshold)
+            mask_fractions.append(float(robot_mask.mean()))
+            if not np.any(robot_mask):
+                continue
+
+            if alpha_ramp and sampled_q.shape[0] > 1:
+                sample_alpha = alpha * (0.45 + 0.55 * (sample_idx / float(sampled_q.shape[0] - 1)))
+            else:
+                sample_alpha = alpha
+            sample_alpha = float(np.clip(sample_alpha, 0.0, 1.0))
+            composite[robot_mask] = (1.0 - sample_alpha) * composite[robot_mask] + sample_alpha * robot_rgb[robot_mask]
+
+        plt.imsave(save_path, np.clip(composite, 0.0, 1.0))
+        return {
+            "save_path": save_path,
+            "camera_name": camera_spec.name,
+            "image_width": int(camera_spec.width),
+            "image_height": int(camera_spec.height),
+            "num_samples_requested": int(num_samples),
+            "num_samples_rendered": int(sampled_q.shape[0]),
+            "sample_times": sample_times.tolist(),
+            "alpha": alpha,
+            "alpha_ramp": bool(alpha_ramp),
+            "robot_mask_threshold": float(robot_mask_threshold),
+            "mean_robot_mask_fraction": float(np.mean(mask_fractions)) if mask_fractions else 0.0,
+            "max_robot_mask_fraction": float(np.max(mask_fractions)) if mask_fractions else 0.0,
+        }
+    finally:
+        if robot is not None:
+            del robot
+        if cameras is not None:
+            del cameras
+        if background_cameras is not None:
+            del background_cameras
+        if scene is not None:
+            del scene
+        if background_scene is not None:
+            del background_scene
+        if sapien is not None:
+            del sapien
+        if background_sapien is not None:
+            del background_sapien
+
+
 def _add_sphere_actor(scene, sapien_module, sphere_spec, color=(0.15, 0.8, 0.2)):
     center = np.asarray(sphere_spec["center"], dtype=np.float32)
     radius = float(sphere_spec["radius"])
@@ -148,9 +293,7 @@ def visualize_esdf_debug_in_sapien(
     if esdf_points.ndim != 2 or esdf_points.shape[1] != 3:
         raise ValueError(f"Expected esdf_points with shape (N, 3), got {esdf_points.shape}")
     if esdf_points.shape[0] != esdf_values.shape[0]:
-        raise ValueError(
-            f"esdf_points/esdf_values size mismatch: {esdf_points.shape[0]} vs {esdf_values.shape[0]}"
-        )
+        raise ValueError(f"esdf_points/esdf_values size mismatch: {esdf_points.shape[0]} vs {esdf_values.shape[0]}")
 
     if not render_viewer:
         return {
@@ -467,6 +610,9 @@ def execute_trajectory_in_sapien(
             "num_waypoints": int(q_traj_np.shape[0]),
             "num_sim_steps": int(sim_steps),
             "max_tracking_error_l2": float(np.max(tracking_error_history)) if tracking_error_history.size else 0.0,
+            "median_tracking_error_l2": (
+                float(np.median(tracking_error_history)) if tracking_error_history.size else 0.0
+            ),
             "mean_tracking_error_l2": float(np.mean(tracking_error_history)) if tracking_error_history.size else 0.0,
             "final_tracking_error_l2": float(tracking_error_history[-1]) if tracking_error_history.size else 0.0,
             "final_qpos": np.asarray(robot.get_qpos(), dtype=np.float32).tolist(),
@@ -486,6 +632,8 @@ class PersistentSapienTrajectoryExecutor:
         self.viewer = None
         self.scene = None
         self.sapien = None
+        self.robot = None
+        self._scene_cache_key = None
 
     def close(self):
         if self.viewer is not None:
@@ -495,7 +643,30 @@ class PersistentSapienTrajectoryExecutor:
             del self.scene
             self.scene = None
         self.sapien = None
+        self.robot = None
+        self._scene_cache_key = None
         gc.collect()
+
+    @staticmethod
+    def _json_default(value):
+        if isinstance(value, np.ndarray):
+            return value.tolist()
+        if isinstance(value, np.generic):
+            return value.item()
+        raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
+
+    def _make_scene_cache_key(self, scene_spec, robot_cfg, add_ground):
+        cache_robot_cfg = dict(robot_cfg or {})
+        cache_robot_cfg.pop("qpos", None)
+        return json.dumps(
+            {
+                "scene_spec": scene_spec,
+                "robot_cfg": cache_robot_cfg,
+                "add_ground": bool(add_ground),
+            },
+            sort_keys=True,
+            default=self._json_default,
+        )
 
     def execute_trajectory(
         self,
@@ -530,15 +701,38 @@ class PersistentSapienTrajectoryExecutor:
         robot_cfg["fix_root_link"] = bool(robot_cfg.get("fix_root_link", True))
         robot_cfg["qpos"] = q_traj_np[0].tolist()
 
-        new_sapien, new_scene, _ = _create_scene(scene_spec=scene_spec, add_ground=add_ground)
-        new_scene.set_timestep(float(scene_timestep))
-        robot = _load_robot_articulation(new_scene, new_sapien, robot_cfg)
-        if robot is None:
-            del new_scene
-            raise RuntimeError("Failed to create the SAPIEN robot articulation for trajectory replay")
+        scene_cache_key = self._make_scene_cache_key(scene_spec, robot_cfg, add_ground)
+        scene_needs_rebuild = (
+            self.scene is None or self.sapien is None or self.robot is None or self._scene_cache_key != scene_cache_key
+        )
+
+        if scene_needs_rebuild:
+            new_sapien, new_scene, _ = _create_scene(scene_spec=scene_spec, add_ground=add_ground)
+            new_scene.set_timestep(float(scene_timestep))
+            robot = _load_robot_articulation(new_scene, new_sapien, robot_cfg)
+            if robot is None:
+                del new_scene
+                raise RuntimeError("Failed to create the SAPIEN robot articulation for trajectory replay")
+
+            old_scene = self.scene
+            self.scene = new_scene
+            self.sapien = new_sapien
+            self.robot = robot
+            self._scene_cache_key = scene_cache_key
+
+            if old_scene is not None:
+                del old_scene
+        else:
+            new_sapien = self.sapien
+            new_scene = self.scene
+            robot = self.robot
+            new_scene.set_timestep(float(scene_timestep))
+            if hasattr(robot, "set_qpos"):
+                robot.set_qpos(q_traj_np[0])
 
         if q_traj_np.shape[1] != robot.dof:
-            del new_scene
+            if scene_needs_rebuild:
+                self.close()
             raise ValueError(
                 f"Trajectory dof mismatch: planner produced {q_traj_np.shape[1]} joints but SAPIEN robot has {robot.dof}"
             )
@@ -548,7 +742,8 @@ class PersistentSapienTrajectoryExecutor:
 
         active_joints = robot.get_active_joints()
         if len(active_joints) != robot.dof:
-            del new_scene
+            if scene_needs_rebuild:
+                self.close()
             raise RuntimeError(
                 f"Unexpected active joint count for replay: expected {robot.dof}, got {len(active_joints)}"
             )
@@ -565,14 +760,10 @@ class PersistentSapienTrajectoryExecutor:
                 mode=str(drive_mode),
             )
 
-        old_scene = self.scene
-        self.scene = new_scene
-        self.sapien = new_sapien
-
         if render_viewer:
             if self.viewer is None or getattr(self.viewer, "closed", False):
                 self.viewer = new_scene.create_viewer()
-            else:
+            elif scene_needs_rebuild:
                 self.viewer.set_scene(new_scene)
             _configure_viewer(
                 self.viewer,
@@ -580,9 +771,6 @@ class PersistentSapienTrajectoryExecutor:
                 new_sapien,
                 view_preset=viewer_preset or self.viewer_preset,
             )
-
-        if old_scene is not None:
-            del old_scene
 
         q_target_history = []
         tracking_error_history = []
@@ -643,6 +831,9 @@ class PersistentSapienTrajectoryExecutor:
             "num_waypoints": int(q_traj_np.shape[0]),
             "num_sim_steps": int(sim_steps),
             "max_tracking_error_l2": float(np.max(tracking_error_history)) if tracking_error_history.size else 0.0,
+            "median_tracking_error_l2": (
+                float(np.median(tracking_error_history)) if tracking_error_history.size else 0.0
+            ),
             "mean_tracking_error_l2": float(np.mean(tracking_error_history)) if tracking_error_history.size else 0.0,
             "final_tracking_error_l2": float(tracking_error_history[-1]) if tracking_error_history.size else 0.0,
             "final_qpos": np.asarray(robot.get_qpos(), dtype=np.float32).tolist(),

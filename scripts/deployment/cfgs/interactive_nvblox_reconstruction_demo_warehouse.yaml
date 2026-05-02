@@ -1,0 +1,108 @@
+results_dir: logs/interactive_nvblox_reconstruction_demo
+
+device: cuda
+seed: 2
+
+viser_host: 127.0.0.1
+viser_port: 8081
+viser_label: MPD nvblox Reconstruction Demo
+
+rotation_z_axis_deg: 0.0
+
+extra_boxes:
+  - name: runtime_box_0
+    center: [0.85, 0.10, 0.125]
+    size: [0.10, 0.25, 0.25]
+  - name: runtime_box_1
+    center: [0.60, -0.15, 0.25]
+    size: [0.25, 0.25, 0.50]
+
+camera_specs:
+  - name: overhead_main
+    width: 640
+    height: 480
+    fov_y_deg: 55.0
+    position: [1.15, -0.85, 1.45]
+    target: [0.55, 0.05, 0.40]
+    near: 0.1
+    far: 4.0
+  - name: side_main
+    width: 640
+    height: 480
+    fov_y_deg: 55.0
+    position: [1.25, 0.55, 1.10]
+    target: [0.50, 0.05, 0.45]
+    near: 0.1
+    far: 4.0
+
+add_ground: false
+capture_backend: stereo_depth_sensor
+mask_robot_from_depth: false
+robot_depth_mask_epsilon_m: 0.1
+robot_depth_mask_dilation_px: 5
+stereo_sensor_config: {}
+
+robot:
+  enabled: true
+  gripper: true
+  qpos: [0.0, -0.785398, 0.0, -2.356194, 0.0, 1.570796, 0.785398]
+
+integrator_type: tsdf
+extraction_method: tsdf_sparse
+pose_convention: sapien
+voxel_size: 0.05
+workspace_padding: 0.0
+query_chunk_size: 250000
+
+occupancy_threshold_log_odds: 0.0
+tsdf_weight_threshold: 0.0001
+tsdf_distance_threshold: 0.0
+
+min_component_voxels: 4
+max_boxes:
+merge_strategy: greedy_cuboids
+
+ignore_scene_box_sources:
+  - fixed
+ignore_scene_box_margin: 0.10
+ignore_boxes: []
+ignore_box_margin: 0.0
+subtract_robot: true
+robot_sphere_margin: 0.1
+inflate_robot_mask_by_voxel_extent: false
+accumulate_map: false
+# The demo tries these methods in order to clear the same nvblox mapper
+# between button-triggered captures. If none exists in the installed nvblox_torch,
+# the script falls back to recreating the mapper and reports that in viser.
+mapper_reset_methods: [clear, reset, clear_map, reset_map, clear_mapper, reset_mapper]
+
+mapper_params:
+  projective_integrator_params:
+    projective_integrator_max_integration_distance_m: 4.0
+
+capture_results_subdir: capture
+reconstruction_results_subdir: nvblox
+bundle_filename: depth_capture_bundle.npz
+scene_spec_filename: scene_spec.yaml
+capture_request_filename: capture_request.yaml
+save_outputs_on_click: true
+save_runtime_state_on_click: true
+save_depth_bundle: true
+save_depth_previews: false
+preview_dirname: depth_previews
+preview_cmap: viridis
+boxes_filename: reconstructed_boxes.yaml
+summary_filename: reconstruction_summary.yaml
+voxels_filename: occupied_voxels.npz
+save_occupancy_projections: false
+projection_dirname: occupancy_projections
+projection_prefix: interactive_nvblox
+
+runtime_state_filename: interactive_nvblox_state.yaml
+show_camera_frames: true
+camera_axes_length: 0.12
+show_robot_model: true
+show_robot_collision: false
+show_occupied_voxels: false
+max_occupied_voxels_to_render: 10000
+occupied_voxel_point_size: 0.012

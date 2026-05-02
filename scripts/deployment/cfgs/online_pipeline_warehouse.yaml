@@ -10,10 +10,10 @@ phase3_results_subdir: phase3_nvblox
 phase1_results_subdir: phase1_planning
 
 # Leave q_start/ee_goal_pose null to reuse the Phase 1 reference sample.
-q_start: null
+q_start: [ 1.1994, -0.4353, -1.9970, -2.0354,  1.4942,  2.4579,  1.6840]
 ee_goal_pose: null
 reference_split: validation
-reference_index: 1
+reference_index: 2
 
 # If null, the pipeline uses the Phase 2 config's extra_boxes as the capture-time
 # runtime obstacles and Phase 1 consumes only the reconstructed boxes.
@@ -33,6 +33,18 @@ show_pre_pruning_collision_viewer: true
 show_noncolliding_pre_pruning_boxes: true
 pre_pruning_collision_add_ground: false
 pre_pruning_collision_viewer_preset: isaac_gym_default
+
+# Save a single image that overlays the robot at evenly spaced points along the selected trajectory.
+save_trajectory_composite: true
+trajectory_composite_filename: trajectory_composite.png
+trajectory_composite_stats_filename: trajectory_composite_summary.yaml
+trajectory_composite_num_points: 32
+trajectory_composite_alpha: 0.35
+trajectory_composite_alpha_ramp: true
+trajectory_composite_robot_mask_threshold: 0.03
+trajectory_composite_add_ground: false
+# Leave null to reuse the first Phase 2 camera; set a camera spec here to choose a different view.
+trajectory_composite_camera:
 
 # Optional shallow/deep overrides for the underlying phase configs.
 phase1_overrides: {}

@@ -52,7 +52,7 @@ ik_lr: 0.2
 ik_se3_eps: 0.05
 
 run_sapien: true
-render_sapien_viewer: true
+render_sapien_viewer: false
 sapien_viewer_preset: isaac_gym_default
 sapien_add_ground: false
 sapien_scene_timestep: 0.004166666666666667
